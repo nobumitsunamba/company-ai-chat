@@ -144,6 +144,18 @@ export default function ChatInterface() {
         body: formData,
       });
 
+      // JSON でないレスポンス（HTML エラーページなど）を明示的に処理する
+      const contentType = res.headers.get("content-type") ?? "";
+      if (!contentType.includes("application/json")) {
+        const raw = await res.text().catch(() => "(レスポンス本文を取得できませんでした)");
+        setUploadError({
+          message: `サーバーエラー (HTTP ${res.status})`,
+          detail: `Content-Type: ${contentType || "(不明)"}`,
+          stack: raw.slice(0, 500), // 先頭500文字をスタック欄に表示
+        });
+        return;
+      }
+
       const data = await res.json();
 
       if (!res.ok) {

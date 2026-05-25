@@ -6,8 +6,10 @@ import type { DocumentChunk } from "@/types";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
+// キャッシュを無効化し、常に動的にルートを処理する
+export const dynamic = "force-dynamic";
 
-/** 1ドキュメントあたりのチャンク上限（レスポンスサイズ制御） */
+/** 1ドキュメントあたりのチャンク上限 */
 const MAX_CHUNKS = 500;
 
 /** エラーを JSON シリアライズ可能な形式に変換 */
@@ -18,126 +20,140 @@ function serializeError(err: unknown): { detail: string; stack?: string } {
   return { detail: String(err) };
 }
 
-export async function POST(req: NextRequest) {
+/** 常に JSON を返すラッパー（HTML エラーページを防ぐ） */
+function jsonError(
+  error: string,
+  extra: Record<string, unknown> = {},
+  status = 500
+): NextResponse {
+  return NextResponse.json({ error, ...extra }, { status });
+}
+
+export async function POST(req: NextRequest): Promise<NextResponse> {
+  // ── 最外殻 try-catch：何があっても JSON を返す ─────────────────────────
   try {
-    const formData = await req.formData();
-    const file = formData.get("file") as File | null;
-
-    if (!file) {
-      return NextResponse.json(
-        { error: "ファイルが指定されていません" },
-        { status: 400 }
-      );
-    }
-
-    // ── ファイル形式チェック ──────────────────────────────────────────────
-    const allowedTypes = [
-      "application/pdf",
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      "application/msword",
-      "text/plain",
-      "text/markdown",
-      "text/csv",
-    ];
-    const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
-    const allowedExts = ["pdf", "docx", "doc", "txt", "md", "csv"];
-
-    if (!allowedTypes.includes(file.type) && !allowedExts.includes(ext)) {
-      return NextResponse.json(
-        {
-          error:
-            "対応していないファイル形式です。PDF、Word、テキストファイルをアップロードしてください。",
-          detail: `MIMEタイプ: "${file.type}", 拡張子: ".${ext}"`,
-        },
-        { status: 400 }
-      );
-    }
-
-    // ── サイズチェック ───────────────────────────────────────────────────
-    if (file.size > 10 * 1024 * 1024) {
-      return NextResponse.json(
-        {
-          error: "ファイルサイズは10MB以下にしてください。",
-          detail: `受け取ったサイズ: ${(file.size / 1024 / 1024).toFixed(2)} MB`,
-        },
-        { status: 400 }
-      );
-    }
-
-    // ── Buffer に変換（/tmp への不要な書き込みは行わない） ────────────────
-    const buffer = Buffer.from(await file.arrayBuffer());
-
-    // ── テキスト抽出 ─────────────────────────────────────────────────────
-    let text: string;
-    try {
-      text = await extractText(buffer, file.type, file.name);
-    } catch (err) {
-      console.error("[upload] Text extraction error:", err);
-      return NextResponse.json(
-        {
-          error:
-            "ファイルのテキスト抽出に失敗しました。ファイルが破損していないか確認してください。",
-          ...serializeError(err),
-        },
-        { status: 422 }
-      );
-    }
-
-    if (!text || text.trim().length === 0) {
-      return NextResponse.json(
-        {
-          error: "ファイルからテキストを抽出できませんでした。",
-          detail:
-            "テキストレイヤーがないか、暗号化されている可能性があります。",
-        },
-        { status: 422 }
-      );
-    }
-
-    // ── チャンク分割 ─────────────────────────────────────────────────────
-    const rawChunks = splitIntoChunks(text);
-    const truncated = rawChunks.length > MAX_CHUNKS;
-    const usedChunks = truncated ? rawChunks.slice(0, MAX_CHUNKS) : rawChunks;
-
-    const documentId = randomUUID();
-    const chunks: DocumentChunk[] = usedChunks.map((content, index) => ({
-      id: `${documentId}-${index}`,
-      documentId,
-      documentName: file.name,
-      content,
-      index,
-    }));
-
-    const doc = {
-      id: documentId,
-      name: file.name,
-      type: file.type || `application/${ext}`,
-      size: file.size,
-      uploadedAt: new Date().toISOString(),
-      chunkCount: chunks.length,
-    };
-
-    // ── Vercel KV に保存（フォールバック：インメモリ） ────────────────────
-    await addDocument(doc, chunks);
-
-    // ── レスポンス：チャンクをクライアントに返す ──────────────────────────
-    // クライアント (localStorage) がチャンクを保持することで
-    // KV 未設定時もブラウザ側 RAG が確実に動作する。
-    return NextResponse.json({
-      ...doc,
-      chunks,
-      ...(truncated && {
-        warning: `文書が大きいため、先頭 ${MAX_CHUNKS} チャンクのみ使用されます。`,
-      }),
-    });
+    return await handleUpload(req);
   } catch (err) {
-    console.error("[upload] Unexpected error:", err);
-    return NextResponse.json(
-      {
-        error: "アップロード中に予期せぬエラーが発生しました。",
-        ...serializeError(err),
-      },
-      { status: 500 }
+    // handleUpload 内の try-catch を抜けた例外（あってはならないが念のため）
+    console.error("[upload] Unhandled error:", err);
+    return jsonError(
+      "アップロード中に予期せぬエラーが発生しました。",
+      serializeError(err),
+      500
     );
   }
+}
+
+async function handleUpload(req: NextRequest): Promise<NextResponse> {
+  // ── FormData パース ──────────────────────────────────────────────────────
+  let formData: FormData;
+  try {
+    formData = await req.formData();
+  } catch (err) {
+    return jsonError("リクエストの解析に失敗しました。", serializeError(err), 400);
+  }
+
+  const file = formData.get("file") as File | null;
+  if (!file) {
+    return jsonError("ファイルが指定されていません", {}, 400);
+  }
+
+  // ── ファイル形式チェック ──────────────────────────────────────────────────
+  const ext = (file.name.split(".").pop() ?? "").toLowerCase();
+  const allowedTypes = [
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "text/plain",
+    "text/markdown",
+    "text/csv",
+  ];
+  const allowedExts = ["pdf", "docx", "doc", "txt", "md", "csv"];
+
+  if (!allowedTypes.includes(file.type) && !allowedExts.includes(ext)) {
+    return jsonError(
+      "対応していないファイル形式です。PDF・Word・テキストファイルをアップロードしてください。",
+      { detail: `受け取ったMIMEタイプ: "${file.type}", 拡張子: ".${ext}"` },
+      400
+    );
+  }
+
+  // ── サイズチェック ───────────────────────────────────────────────────────
+  if (file.size > 10 * 1024 * 1024) {
+    return jsonError(
+      "ファイルサイズは10MB以下にしてください。",
+      { detail: `受け取ったサイズ: ${(file.size / 1024 / 1024).toFixed(2)} MB` },
+      400
+    );
+  }
+
+  // ── Buffer 変換 ──────────────────────────────────────────────────────────
+  let buffer: Buffer;
+  try {
+    buffer = Buffer.from(await file.arrayBuffer());
+  } catch (err) {
+    return jsonError("ファイルの読み込みに失敗しました。", serializeError(err), 422);
+  }
+
+  // ── テキスト抽出 ─────────────────────────────────────────────────────────
+  let text: string;
+  try {
+    text = await extractText(buffer, file.type, file.name);
+  } catch (err) {
+    console.error("[upload] Text extraction error:", err);
+    return jsonError(
+      "ファイルのテキスト抽出に失敗しました。ファイルが破損していないか確認してください。",
+      serializeError(err),
+      422
+    );
+  }
+
+  if (!text || text.trim().length === 0) {
+    return jsonError(
+      "ファイルからテキストを抽出できませんでした。",
+      { detail: "テキストレイヤーがないか、暗号化されている可能性があります。" },
+      422
+    );
+  }
+
+  // ── チャンク分割 ─────────────────────────────────────────────────────────
+  const rawChunks = splitIntoChunks(text);
+  const truncated = rawChunks.length > MAX_CHUNKS;
+  const usedChunks = truncated ? rawChunks.slice(0, MAX_CHUNKS) : rawChunks;
+
+  const documentId = randomUUID();
+  const chunks: DocumentChunk[] = usedChunks.map((content, index) => ({
+    id: `${documentId}-${index}`,
+    documentId,
+    documentName: file.name,
+    content,
+    index,
+  }));
+
+  const doc = {
+    id: documentId,
+    name: file.name,
+    type: file.type || `application/${ext}`,
+    size: file.size,
+    uploadedAt: new Date().toISOString(),
+    chunkCount: chunks.length,
+  };
+
+  // ── Vercel KV / インメモリ に保存（失敗してもレスポンスは返す） ───────────
+  try {
+    await addDocument(doc, chunks);
+  } catch (err) {
+    // KV 保存失敗はログに残すが、クライアント側 localStorage があるため続行
+    console.error("[upload] addDocument failed (non-fatal):", err);
+  }
+
+  // ── 成功レスポンス ────────────────────────────────────────────────────────
+  // chunks をクライアントに返す → ブラウザ localStorage で保持 → チャット時に送信
+  return NextResponse.json({
+    ...doc,
+    chunks,
+    ...(truncated && {
+      warning: `文書が大きいため、先頭 ${MAX_CHUNKS} チャンクのみ使用されます。`,
+    }),
+  });
 }

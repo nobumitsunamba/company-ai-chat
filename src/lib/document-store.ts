@@ -1,25 +1,27 @@
 /**
  * Vercel KV (Upstash Redis) バックエンドのドキュメントストア。
  *
- * 環境変数 KV_URL または KV_REST_API_URL が設定されていれば KV を使用。
- * 設定されていない場合（ローカル開発時）はインメモリにフォールバック。
- *
- * KV キー設計:
- *   cai:docs:index          → 文書 ID の Sorted Set（score = uploadedAt timestamp）
- *   cai:doc:{id}            → Document メタデータ（JSON）
- *   cai:chunks:{id}         → DocumentChunk[] （JSON）
+ * 環境変数 KV_REST_API_URL + KV_REST_API_TOKEN が両方設定されていれば KV を使用。
+ * 未設定時はインメモリにフォールバック（ローカル開発・KV 未設定時）。
  *
  * 注意：
- *   クライアント（ブラウザ）も localStorage にチャンクを保持しており、
- *   チャット送信時はクライアント側で TF-IDF 検索した結果を context 文字列として
- *   送信するため、KV はあくまで「サーバー側フォールバック」として機能する。
+ *   @vercel/kv v2 は環境変数が未設定の状態でモジュールを require/import すると
+ *   初期化時に例外を投げる。そのため next.config.mjs で
+ *   serverComponentsExternalPackages に追加し、バンドルを避けている。
+ *   さらに isKVReady() チェック後にのみ動的 import させることで
+ *   未設定環境での例外を完全に回避する。
+ *
+ * KV キー設計:
+ *   cai:docs:index    → Sorted Set (score = uploadedAt ms, member = docId)
+ *   cai:doc:{id}      → Document メタデータ
+ *   cai:chunks:{id}   → DocumentChunk[]
  */
 
 import type { Document, DocumentChunk } from "@/types";
 
 // ─── KV キー ─────────────────────────────────────────────────────────────────
 
-const P = "cai"; // キープレフィックス
+const P = "cai";
 const INDEX_KEY = `${P}:docs:index`;
 const docKey = (id: string) => `${P}:doc:${id}`;
 const chunksKey = (id: string) => `${P}:chunks:${id}`;
@@ -27,20 +29,36 @@ const chunksKey = (id: string) => `${P}:chunks:${id}`;
 // ─── KV 可用性チェック ────────────────────────────────────────────────────────
 
 function isKVReady(): boolean {
+  // KV_URL または REST API の両方が揃っているときのみ有効
   return !!(
     process.env.KV_URL ||
     (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN)
   );
 }
 
-/** KV クライアントを取得（未設定時は null） */
-async function tryGetKV() {
+// KV クライアントのキャッシュ（同一インスタンス内で再利用）
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _kv: any = null;
+
+/**
+ * KV クライアントを取得する。
+ * - 環境変数が未設定 → null を返す（インメモリフォールバックを使う）
+ * - 環境変数が設定済み → @vercel/kv を動的 import して kv を返す
+ * - import/初期化失敗 → null を返す（エラーは console に出力）
+ */
+async function tryGetKV(): Promise<typeof _kv | null> {
   if (!isKVReady()) return null;
+  if (_kv) return _kv; // キャッシュ済み
+
   try {
-    const { kv } = await import("@vercel/kv");
-    return kv;
+    // next.config.mjs で serverComponentsExternalPackages に @vercel/kv を追加済み。
+    // isKVReady() が true のとき（= env var が設定済み）のみここに到達するため
+    // @vercel/kv の初期化例外は発生しない。
+    const mod = await import("@vercel/kv");
+    _kv = mod.kv;
+    return _kv;
   } catch (e) {
-    console.error("[document-store] @vercel/kv import failed:", e);
+    console.error("[document-store] @vercel/kv import/init failed:", e);
     return null;
   }
 }
@@ -65,7 +83,6 @@ export async function addDocument(
       await Promise.all([
         kv.set(docKey(doc.id), doc),
         kv.set(chunksKey(doc.id), chunks),
-        // Sorted Set にドキュメント ID を登録（score = アップロード時刻 ms）
         kv.zadd(INDEX_KEY, {
           score: new Date(doc.uploadedAt).getTime(),
           member: doc.id,
@@ -76,10 +93,11 @@ export async function addDocument(
       console.error("[document-store] KV write failed, using in-memory:", e);
     }
   } else {
-    console.warn("[document-store] KV not configured, using in-memory store");
+    console.warn(
+      "[document-store] KV not configured – using in-memory store (data lost on restart)"
+    );
   }
 
-  // インメモリフォールバック
   mem.docs.set(doc.id, doc);
   mem.chunks.set(doc.id, chunks);
 }
@@ -89,14 +107,13 @@ export async function getAllDocuments(): Promise<Document[]> {
 
   if (kv) {
     try {
-      // Sorted Set から ID を新しい順（降順）で取得
       const ids = (await kv.zrange(INDEX_KEY, 0, -1, {
         rev: true,
       })) as string[];
       if (ids.length === 0) return [];
 
-      const docs = await Promise.all(
-        ids.map((id) => kv.get<Document>(docKey(id)))
+      const docs: (Document | null)[] = await Promise.all(
+        ids.map((id: string) => kv.get(docKey(id)) as Promise<Document | null>)
       );
       return docs.filter((d): d is Document => d !== null);
     } catch (e) {
@@ -115,12 +132,12 @@ export async function deleteDocument(id: string): Promise<boolean> {
 
   if (kv) {
     try {
-      const [delDoc, , delIndex] = await Promise.all([
+      const results = await Promise.all([
         kv.del(docKey(id)),
         kv.del(chunksKey(id)),
         kv.zrem(INDEX_KEY, id),
       ]);
-      return delDoc > 0 || (delIndex as number) > 0;
+      return results.some((r: number) => r > 0);
     } catch (e) {
       console.error("[document-store] KV delete failed:", e);
     }
@@ -137,7 +154,7 @@ export async function getChunks(documentId: string): Promise<DocumentChunk[]> {
 
   if (kv) {
     try {
-      const chunks = await kv.get<DocumentChunk[]>(chunksKey(documentId));
+      const chunks = (await kv.get(chunksKey(documentId))) as DocumentChunk[] | null;
       return chunks ?? [];
     } catch (e) {
       console.error("[document-store] KV chunk read failed:", e);
