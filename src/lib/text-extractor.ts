@@ -57,12 +57,23 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
   //   ③ CJK フォント（日本語など）のサポートが不完全
   // pdfjs-dist 5.x はこれらをすべて解決している。
   //
-  // workerSrc: require.resolve() で絶対パスを取得し "file://" を付与する。
+  // workerSrc: require.resolve('.mjs') は webpack がビルド時に ESM として解析しようとして
+  //   "ESM packages need to be imported" エラーになる。
+  //   代わりに path.join(process.cwd(), 'node_modules/...') で絶対パスを構築する。
   //   serverComponentsExternalPackages に pdfjs-dist を追加してあるため
   //   Vercel デプロイでも node_modules 以下のファイルがそのまま利用できる。
   // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const path = require("path") as typeof import("path");
   const workerSrc =
-    "file://" + require.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs");
+    "file://" +
+    path.join(
+      process.cwd(),
+      "node_modules",
+      "pdfjs-dist",
+      "legacy",
+      "build",
+      "pdf.worker.mjs"
+    );
 
   const { getDocument, GlobalWorkerOptions } = await import(
     "pdfjs-dist/legacy/build/pdf.mjs"
