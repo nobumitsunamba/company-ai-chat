@@ -1,8 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "crypto";
-import { writeFile, unlink } from "fs/promises";
-import { mkdirSync, existsSync } from "fs";
-import { join } from "path";
 import { extractText, splitIntoChunks } from "@/lib/text-extractor";
 import { addDocument } from "@/lib/document-store";
 import type { DocumentChunk } from "@/types";
@@ -10,34 +7,18 @@ import type { DocumentChunk } from "@/types";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-/** Vercel でファイル書き込み可能な /tmp 配下の一時ディレクトリ */
-const TMP_UPLOAD_DIR = "/tmp/company-ai-chat-uploads";
-
 /** 1ドキュメントあたりのチャンク上限（レスポンスサイズ制御） */
 const MAX_CHUNKS = 500;
 
-function ensureUploadDir(): void {
-  if (!existsSync(TMP_UPLOAD_DIR)) {
-    mkdirSync(TMP_UPLOAD_DIR, { recursive: true });
-  }
-}
-
-/**
- * エラーオブジェクトを JSON シリアライズ可能な形式に変換する。
- */
+/** エラーを JSON シリアライズ可能な形式に変換 */
 function serializeError(err: unknown): { detail: string; stack?: string } {
   if (err instanceof Error) {
-    return {
-      detail: err.message,
-      stack: err.stack,
-    };
+    return { detail: err.message, stack: err.stack };
   }
   return { detail: String(err) };
 }
 
 export async function POST(req: NextRequest) {
-  let tmpPath: string | null = null;
-
   try {
     const formData = await req.formData();
     const file = formData.get("file") as File | null;
@@ -66,7 +47,7 @@ export async function POST(req: NextRequest) {
         {
           error:
             "対応していないファイル形式です。PDF、Word、テキストファイルをアップロードしてください。",
-          detail: `受け取ったMIMEタイプ: "${file.type}", 拡張子: ".${ext}"`,
+          detail: `MIMEタイプ: "${file.type}", 拡張子: ".${ext}"`,
         },
         { status: 400 }
       );
@@ -83,13 +64,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // ── Buffer 化 → /tmp に一時保存 ─────────────────────────────────────
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    ensureUploadDir();
-    tmpPath = join(TMP_UPLOAD_DIR, `${randomUUID()}.${ext || "bin"}`);
-    await writeFile(tmpPath, buffer);
+    // ── Buffer に変換（/tmp への不要な書き込みは行わない） ────────────────
+    const buffer = Buffer.from(await file.arrayBuffer());
 
     // ── テキスト抽出 ─────────────────────────────────────────────────────
     let text: string;
@@ -99,7 +75,8 @@ export async function POST(req: NextRequest) {
       console.error("[upload] Text extraction error:", err);
       return NextResponse.json(
         {
-          error: "ファイルのテキスト抽出に失敗しました。ファイルが破損していないか確認してください。",
+          error:
+            "ファイルのテキスト抽出に失敗しました。ファイルが破損していないか確認してください。",
           ...serializeError(err),
         },
         { status: 422 }
@@ -111,7 +88,7 @@ export async function POST(req: NextRequest) {
         {
           error: "ファイルからテキストを抽出できませんでした。",
           detail:
-            "ファイルにテキストレイヤーがないか、暗号化されている可能性があります。",
+            "テキストレイヤーがないか、暗号化されている可能性があります。",
         },
         { status: 422 }
       );
@@ -122,12 +99,6 @@ export async function POST(req: NextRequest) {
     const truncated = rawChunks.length > MAX_CHUNKS;
     const usedChunks = truncated ? rawChunks.slice(0, MAX_CHUNKS) : rawChunks;
 
-    if (truncated) {
-      console.warn(
-        `[upload] "${file.name}": ${rawChunks.length} chunks truncated to ${MAX_CHUNKS}`
-      );
-    }
-
     const documentId = randomUUID();
     const chunks: DocumentChunk[] = usedChunks.map((content, index) => ({
       id: `${documentId}-${index}`,
@@ -137,29 +108,23 @@ export async function POST(req: NextRequest) {
       index,
     }));
 
-    // ── サーバー側ストアにも保存（同一インスタンス内のフォールバック用） ──
-    addDocument(
-      {
-        id: documentId,
-        name: file.name,
-        type: file.type || `application/${ext}`,
-        size: file.size,
-        uploadedAt: new Date().toISOString(),
-        chunkCount: chunks.length,
-      },
-      chunks
-    );
-
-    // ── レスポンス：チャンクをクライアントに返す ──────────────────────────
-    // Vercel サーバーレスではインスタンス間で /tmp が共有されないため、
-    // クライアント (localStorage) がチャンクを保持し、チャット時に送り返す。
-    return NextResponse.json({
+    const doc = {
       id: documentId,
       name: file.name,
       type: file.type || `application/${ext}`,
       size: file.size,
-      chunkCount: chunks.length,
       uploadedAt: new Date().toISOString(),
+      chunkCount: chunks.length,
+    };
+
+    // ── Vercel KV に保存（フォールバック：インメモリ） ────────────────────
+    await addDocument(doc, chunks);
+
+    // ── レスポンス：チャンクをクライアントに返す ──────────────────────────
+    // クライアント (localStorage) がチャンクを保持することで
+    // KV 未設定時もブラウザ側 RAG が確実に動作する。
+    return NextResponse.json({
+      ...doc,
       chunks,
       ...(truncated && {
         warning: `文書が大きいため、先頭 ${MAX_CHUNKS} チャンクのみ使用されます。`,
@@ -174,10 +139,5 @@ export async function POST(req: NextRequest) {
       },
       { status: 500 }
     );
-  } finally {
-    // 一時ファイルを必ず削除
-    if (tmpPath) {
-      await unlink(tmpPath).catch(() => {});
-    }
   }
 }

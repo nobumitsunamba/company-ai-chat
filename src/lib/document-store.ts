@@ -1,141 +1,161 @@
 /**
- * /tmp-backed document store.
+ * Vercel KV (Upstash Redis) バックエンドのドキュメントストア。
  *
- * Vercel serverless functions can only write to /tmp.
- * We persist document metadata and chunks there so that
- * data survives multiple requests within the same container.
+ * 環境変数 KV_URL または KV_REST_API_URL が設定されていれば KV を使用。
+ * 設定されていない場合（ローカル開発時）はインメモリにフォールバック。
  *
- * Layout:
- *   /tmp/company-ai-chat/documents.json      ← Document[] metadata
- *   /tmp/company-ai-chat/chunks-{id}.json    ← DocumentChunk[] per doc
+ * KV キー設計:
+ *   cai:docs:index          → 文書 ID の Sorted Set（score = uploadedAt timestamp）
+ *   cai:doc:{id}            → Document メタデータ（JSON）
+ *   cai:chunks:{id}         → DocumentChunk[] （JSON）
+ *
+ * 注意：
+ *   クライアント（ブラウザ）も localStorage にチャンクを保持しており、
+ *   チャット送信時はクライアント側で TF-IDF 検索した結果を context 文字列として
+ *   送信するため、KV はあくまで「サーバー側フォールバック」として機能する。
  */
 
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-  unlinkSync,
-} from "fs";
 import type { Document, DocumentChunk } from "@/types";
 
-const BASE_DIR = "/tmp/company-ai-chat";
-const DOCS_PATH = `${BASE_DIR}/documents.json`;
-const chunksPath = (id: string) => `${BASE_DIR}/chunks-${id}.json`;
+// ─── KV キー ─────────────────────────────────────────────────────────────────
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+const P = "cai"; // キープレフィックス
+const INDEX_KEY = `${P}:docs:index`;
+const docKey = (id: string) => `${P}:doc:${id}`;
+const chunksKey = (id: string) => `${P}:chunks:${id}`;
 
-function ensureBaseDir(): void {
-  if (!existsSync(BASE_DIR)) {
-    mkdirSync(BASE_DIR, { recursive: true });
-  }
-}
+// ─── KV 可用性チェック ────────────────────────────────────────────────────────
 
-// ─── Documents ───────────────────────────────────────────────────────────────
-
-/** In-memory cache: populated from /tmp on first access. */
-let docsCache: Map<string, Document> | null = null;
-
-function getDocsCache(): Map<string, Document> {
-  if (docsCache !== null) return docsCache;
-  try {
-    ensureBaseDir();
-    if (existsSync(DOCS_PATH)) {
-      const arr: Document[] = JSON.parse(readFileSync(DOCS_PATH, "utf-8"));
-      docsCache = new Map(arr.map((d) => [d.id, d]));
-      return docsCache;
-    }
-  } catch (e) {
-    console.error("[document-store] Failed to load documents from /tmp:", e);
-  }
-  docsCache = new Map();
-  return docsCache;
-}
-
-function persistDocs(): void {
-  try {
-    ensureBaseDir();
-    const arr = Array.from(getDocsCache().values());
-    writeFileSync(DOCS_PATH, JSON.stringify(arr), "utf-8");
-  } catch (e) {
-    console.error("[document-store] Failed to persist documents to /tmp:", e);
-  }
-}
-
-// ─── Chunks ──────────────────────────────────────────────────────────────────
-
-function loadChunks(documentId: string): DocumentChunk[] {
-  const p = chunksPath(documentId);
-  try {
-    if (existsSync(p)) {
-      return JSON.parse(readFileSync(p, "utf-8"));
-    }
-  } catch (e) {
-    console.error(`[document-store] Failed to load chunks for ${documentId}:`, e);
-  }
-  return [];
-}
-
-function persistChunks(documentId: string, chunks: DocumentChunk[]): void {
-  try {
-    ensureBaseDir();
-    writeFileSync(chunksPath(documentId), JSON.stringify(chunks), "utf-8");
-  } catch (e) {
-    console.error(`[document-store] Failed to persist chunks for ${documentId}:`, e);
-  }
-}
-
-// ─── Public API ──────────────────────────────────────────────────────────────
-
-export function addDocument(doc: Document, chunks: DocumentChunk[]): void {
-  getDocsCache().set(doc.id, doc);
-  persistDocs();
-  persistChunks(doc.id, chunks);
-}
-
-export function getDocument(id: string): Document | undefined {
-  return getDocsCache().get(id);
-}
-
-export function getAllDocuments(): Document[] {
-  return Array.from(getDocsCache().values()).sort(
-    (a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
+function isKVReady(): boolean {
+  return !!(
+    process.env.KV_URL ||
+    (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN)
   );
 }
 
-export function deleteDocument(id: string): boolean {
-  const cache = getDocsCache();
-  const existed = cache.has(id);
-  if (existed) {
-    cache.delete(id);
-    persistDocs();
-    // Remove chunks file from /tmp
+/** KV クライアントを取得（未設定時は null） */
+async function tryGetKV() {
+  if (!isKVReady()) return null;
+  try {
+    const { kv } = await import("@vercel/kv");
+    return kv;
+  } catch (e) {
+    console.error("[document-store] @vercel/kv import failed:", e);
+    return null;
+  }
+}
+
+// ─── インメモリフォールバック（ローカル開発 / KV 未設定時） ────────────────────
+
+const mem = {
+  docs: new Map<string, Document>(),
+  chunks: new Map<string, DocumentChunk[]>(),
+};
+
+// ─── Public API（全て非同期） ─────────────────────────────────────────────────
+
+export async function addDocument(
+  doc: Document,
+  chunks: DocumentChunk[]
+): Promise<void> {
+  const kv = await tryGetKV();
+
+  if (kv) {
     try {
-      const p = chunksPath(id);
-      if (existsSync(p)) unlinkSync(p);
-    } catch {
-      // ignore cleanup errors
+      await Promise.all([
+        kv.set(docKey(doc.id), doc),
+        kv.set(chunksKey(doc.id), chunks),
+        // Sorted Set にドキュメント ID を登録（score = アップロード時刻 ms）
+        kv.zadd(INDEX_KEY, {
+          score: new Date(doc.uploadedAt).getTime(),
+          member: doc.id,
+        }),
+      ]);
+      return;
+    } catch (e) {
+      console.error("[document-store] KV write failed, using in-memory:", e);
+    }
+  } else {
+    console.warn("[document-store] KV not configured, using in-memory store");
+  }
+
+  // インメモリフォールバック
+  mem.docs.set(doc.id, doc);
+  mem.chunks.set(doc.id, chunks);
+}
+
+export async function getAllDocuments(): Promise<Document[]> {
+  const kv = await tryGetKV();
+
+  if (kv) {
+    try {
+      // Sorted Set から ID を新しい順（降順）で取得
+      const ids = (await kv.zrange(INDEX_KEY, 0, -1, {
+        rev: true,
+      })) as string[];
+      if (ids.length === 0) return [];
+
+      const docs = await Promise.all(
+        ids.map((id) => kv.get<Document>(docKey(id)))
+      );
+      return docs.filter((d): d is Document => d !== null);
+    } catch (e) {
+      console.error("[document-store] KV read failed:", e);
     }
   }
+
+  return Array.from(mem.docs.values()).sort(
+    (a, b) =>
+      new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
+  );
+}
+
+export async function deleteDocument(id: string): Promise<boolean> {
+  const kv = await tryGetKV();
+
+  if (kv) {
+    try {
+      const [delDoc, , delIndex] = await Promise.all([
+        kv.del(docKey(id)),
+        kv.del(chunksKey(id)),
+        kv.zrem(INDEX_KEY, id),
+      ]);
+      return delDoc > 0 || (delIndex as number) > 0;
+    } catch (e) {
+      console.error("[document-store] KV delete failed:", e);
+    }
+  }
+
+  const existed = mem.docs.has(id);
+  mem.docs.delete(id);
+  mem.chunks.delete(id);
   return existed;
 }
 
-export function getChunks(documentId: string): DocumentChunk[] {
-  return loadChunks(documentId);
-}
+export async function getChunks(documentId: string): Promise<DocumentChunk[]> {
+  const kv = await tryGetKV();
 
-export function getAllChunks(): DocumentChunk[] {
-  const all: DocumentChunk[] = [];
-  getDocsCache().forEach((_, id) => {
-    all.push(...loadChunks(id));
-  });
-  return all;
-}
-
-export function getChunksByDocumentIds(documentIds: string[]): DocumentChunk[] {
-  const result: DocumentChunk[] = [];
-  for (const id of documentIds) {
-    result.push(...loadChunks(id));
+  if (kv) {
+    try {
+      const chunks = await kv.get<DocumentChunk[]>(chunksKey(documentId));
+      return chunks ?? [];
+    } catch (e) {
+      console.error("[document-store] KV chunk read failed:", e);
+    }
   }
-  return result;
+
+  return mem.chunks.get(documentId) ?? [];
+}
+
+export async function getAllChunks(): Promise<DocumentChunk[]> {
+  const docs = await getAllDocuments();
+  const nested = await Promise.all(docs.map((d) => getChunks(d.id)));
+  return nested.flat();
+}
+
+export async function getChunksByDocumentIds(
+  documentIds: string[]
+): Promise<DocumentChunk[]> {
+  const nested = await Promise.all(documentIds.map((id) => getChunks(id)));
+  return nested.flat();
 }
