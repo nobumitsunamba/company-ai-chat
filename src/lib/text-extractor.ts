@@ -43,8 +43,11 @@ export async function extractText(
 }
 
 async function extractFromPDF(buffer: Buffer): Promise<string> {
-  // Dynamic import to avoid SSR issues
-  const pdfParse = (await import("pdf-parse")).default;
+  // pdf-parse の index.js はインポート時にテストファイルを読み込もうとする。
+  // Vercel のサーバーレス環境ではテストファイルが存在しないためエラーになるため、
+  // テストコードを含まない内部パスを直接 require する。
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const pdfParse = require("pdf-parse/lib/pdf-parse");
   const data = await pdfParse(buffer);
   return data.text;
 }

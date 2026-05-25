@@ -1,52 +1,133 @@
 /**
- * In-memory document store.
- * Documents and chunks are stored in memory per Node.js process.
- * For production, replace with Vercel KV or a database.
+ * /tmp-backed document store.
+ *
+ * Vercel serverless functions can only write to /tmp.
+ * We persist document metadata and chunks there so that
+ * data survives multiple requests within the same container.
+ *
+ * Layout:
+ *   /tmp/company-ai-chat/documents.json      ← Document[] metadata
+ *   /tmp/company-ai-chat/chunks-{id}.json    ← DocumentChunk[] per doc
  */
 
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  unlinkSync,
+} from "fs";
 import type { Document, DocumentChunk } from "@/types";
 
-interface DocumentStore {
-  documents: Map<string, Document>;
-  chunks: Map<string, DocumentChunk[]>; // documentId -> chunks
+const BASE_DIR = "/tmp/company-ai-chat";
+const DOCS_PATH = `${BASE_DIR}/documents.json`;
+const chunksPath = (id: string) => `${BASE_DIR}/chunks-${id}.json`;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function ensureBaseDir(): void {
+  if (!existsSync(BASE_DIR)) {
+    mkdirSync(BASE_DIR, { recursive: true });
+  }
 }
 
-// Module-level singleton (persists within a single server process)
-const store: DocumentStore = {
-  documents: new Map(),
-  chunks: new Map(),
-};
+// ─── Documents ───────────────────────────────────────────────────────────────
+
+/** In-memory cache: populated from /tmp on first access. */
+let docsCache: Map<string, Document> | null = null;
+
+function getDocsCache(): Map<string, Document> {
+  if (docsCache !== null) return docsCache;
+  try {
+    ensureBaseDir();
+    if (existsSync(DOCS_PATH)) {
+      const arr: Document[] = JSON.parse(readFileSync(DOCS_PATH, "utf-8"));
+      docsCache = new Map(arr.map((d) => [d.id, d]));
+      return docsCache;
+    }
+  } catch (e) {
+    console.error("[document-store] Failed to load documents from /tmp:", e);
+  }
+  docsCache = new Map();
+  return docsCache;
+}
+
+function persistDocs(): void {
+  try {
+    ensureBaseDir();
+    const arr = Array.from(getDocsCache().values());
+    writeFileSync(DOCS_PATH, JSON.stringify(arr), "utf-8");
+  } catch (e) {
+    console.error("[document-store] Failed to persist documents to /tmp:", e);
+  }
+}
+
+// ─── Chunks ──────────────────────────────────────────────────────────────────
+
+function loadChunks(documentId: string): DocumentChunk[] {
+  const p = chunksPath(documentId);
+  try {
+    if (existsSync(p)) {
+      return JSON.parse(readFileSync(p, "utf-8"));
+    }
+  } catch (e) {
+    console.error(`[document-store] Failed to load chunks for ${documentId}:`, e);
+  }
+  return [];
+}
+
+function persistChunks(documentId: string, chunks: DocumentChunk[]): void {
+  try {
+    ensureBaseDir();
+    writeFileSync(chunksPath(documentId), JSON.stringify(chunks), "utf-8");
+  } catch (e) {
+    console.error(`[document-store] Failed to persist chunks for ${documentId}:`, e);
+  }
+}
+
+// ─── Public API ──────────────────────────────────────────────────────────────
 
 export function addDocument(doc: Document, chunks: DocumentChunk[]): void {
-  store.documents.set(doc.id, doc);
-  store.chunks.set(doc.id, chunks);
+  getDocsCache().set(doc.id, doc);
+  persistDocs();
+  persistChunks(doc.id, chunks);
 }
 
 export function getDocument(id: string): Document | undefined {
-  return store.documents.get(id);
+  return getDocsCache().get(id);
 }
 
 export function getAllDocuments(): Document[] {
-  return Array.from(store.documents.values()).sort(
+  return Array.from(getDocsCache().values()).sort(
     (a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime()
   );
 }
 
 export function deleteDocument(id: string): boolean {
-  const existed = store.documents.has(id);
-  store.documents.delete(id);
-  store.chunks.delete(id);
+  const cache = getDocsCache();
+  const existed = cache.has(id);
+  if (existed) {
+    cache.delete(id);
+    persistDocs();
+    // Remove chunks file from /tmp
+    try {
+      const p = chunksPath(id);
+      if (existsSync(p)) unlinkSync(p);
+    } catch {
+      // ignore cleanup errors
+    }
+  }
   return existed;
 }
 
 export function getChunks(documentId: string): DocumentChunk[] {
-  return store.chunks.get(documentId) ?? [];
+  return loadChunks(documentId);
 }
 
 export function getAllChunks(): DocumentChunk[] {
   const all: DocumentChunk[] = [];
-  store.chunks.forEach((chunks) => {
-    all.push(...chunks);
+  getDocsCache().forEach((_, id) => {
+    all.push(...loadChunks(id));
   });
   return all;
 }
@@ -54,8 +135,7 @@ export function getAllChunks(): DocumentChunk[] {
 export function getChunksByDocumentIds(documentIds: string[]): DocumentChunk[] {
   const result: DocumentChunk[] = [];
   for (const id of documentIds) {
-    const chunks = store.chunks.get(id);
-    if (chunks) result.push(...chunks);
+    result.push(...loadChunks(id));
   }
   return result;
 }
