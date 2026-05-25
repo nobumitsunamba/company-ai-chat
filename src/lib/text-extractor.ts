@@ -48,8 +48,48 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
   // テストコードを含まない内部パスを直接 require する。
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const pdfParse = require("pdf-parse/lib/pdf-parse");
-  const data = await pdfParse(buffer);
-  return data.text;
+
+  // ── unhandledRejection 対策 ──────────────────────────────────────────────
+  // pdf-parse 内部の pdf.js は `doc.destroy()` を await せずに呼ぶため、
+  // 複雑な PDF（フォント・リソースが多いもの）の後片付け処理が非同期で失敗すると
+  // unhandledRejection がプロセスレベルに浮上し、Node 15+ ではプロセスがクラッシュ
+  // して Vercel が HTML 500 を返してしまう。
+  // パース処理の間だけリジェクションを吸収するリスナーを一時的に登録することで
+  // プロセスのクラッシュを防ぐ。
+  const rejectionAbsorber = (reason: unknown) => {
+    console.warn(
+      "[pdf-extract] Absorbed unhandledRejection during PDF parsing:",
+      reason
+    );
+  };
+  process.on("unhandledRejection", rejectionAbsorber);
+
+  try {
+    // 25 秒タイムアウト + 最大 150 ページ制限（巨大 PDF によるハングアップ防止）
+    const TIMEOUT_MS = 25_000;
+
+    const parsePromise: Promise<{ text: string }> = pdfParse(buffer, {
+      max: 150,
+    });
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error("PDF解析がタイムアウトしました（25秒超）")),
+        TIMEOUT_MS
+      )
+    );
+
+    const result = await Promise.race([parsePromise, timeoutPromise]);
+
+    // pdf-parse は `doc.destroy()` を await せずに return するため、
+    // パース完了直後に内部クリーンアップの unhandledRejection が発火することがある。
+    // 200ms 待機してクリーンアップが落ち着いてからリスナーを解除する。
+    await new Promise<void>((resolve) => setTimeout(resolve, 200));
+
+    return result.text;
+  } finally {
+    // 成功・失敗を問わず必ずリスナーを解除する
+    process.removeListener("unhandledRejection", rejectionAbsorber);
+  }
 }
 
 async function extractFromDocx(buffer: Buffer): Promise<string> {
