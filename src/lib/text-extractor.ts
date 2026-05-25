@@ -83,10 +83,18 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
     GlobalWorkerOptions: { workerSrc: string };
   };
 
-  // workerSrc を CJS の require.resolve で設定（3.x は .js なので問題なし）
+  // workerSrc: require.resolve() は webpack がビルド時に module ID（数値）へ置換するため
+  // pdfjs の内部で .endsWith() を呼ぶと "not a function" エラーになる。
+  // path.join(process.cwd(), ...) はビルド時に静的解析されず、実行時に正しい絶対パスを返す。
+  // Vercel での process.cwd() は /var/task（プロジェクトルート）。
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  pdfjs.GlobalWorkerOptions.workerSrc = require.resolve(
-    "pdfjs-dist/build/pdf.worker.js"
+  const nodePath = require("path") as typeof import("path");
+  pdfjs.GlobalWorkerOptions.workerSrc = nodePath.join(
+    process.cwd(),
+    "node_modules",
+    "pdfjs-dist",
+    "build",
+    "pdf.worker.js"
   );
 
   const TIMEOUT_MS = 25_000; // 25 秒タイムアウト
