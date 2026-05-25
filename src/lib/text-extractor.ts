@@ -50,52 +50,54 @@ export async function extractText(
 }
 
 async function extractFromPDF(buffer: Buffer): Promise<string> {
-  // ── pdfjs-dist 5.x を直接使用 ──────────────────────────────────────────
-  // pdf-parse (pdf.js v1.10.100) は：
+  // ── pdfjs-dist 3.x を直接使用 ──────────────────────────────────────────
+  // pdf-parse (pdf.js v1.10.100) の問題点：
   //   ① doc.destroy() を await せず → 後片付けが非同期で失敗して unhandledRejection
-  //   ② モジュール変数 PDFJS を使い回す → 複雑な PDF の後に状態汚染
-  //   ③ CJK フォント（日本語など）のサポートが不完全
-  // pdfjs-dist 5.x はこれらをすべて解決している。
+  //   ② モジュール変数 PDFJS を使い回す → 複雑な PDF 後に状態汚染
+  //   ③ CJK フォント（日本語）のサポートが不完全
   //
-  // workerSrc: require.resolve('.mjs') は webpack がビルド時に ESM として解析しようとして
-  //   "ESM packages need to be imported" エラーになる。
-  //   代わりに path.join(process.cwd(), 'node_modules/...') で絶対パスを構築する。
-  //   serverComponentsExternalPackages に pdfjs-dist を追加してあるため
-  //   Vercel デプロイでも node_modules 以下のファイルがそのまま利用できる。
+  // pdfjs-dist 5.x は DOMMatrix など browser-only API を必要とし Node.js では動かない。
+  // pdfjs-dist 3.x は CJS 形式で DOMMatrix 不要、Node.js/Vercel で安定動作する。
+  //
+  // workerSrc: 3.x は .js (CJS) なので require.resolve が使える
+  //   (webpack が ESM として拒否しない)。
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const path = require("path") as typeof import("path");
-  const workerSrc =
-    "file://" +
-    path.join(
-      process.cwd(),
-      "node_modules",
-      "pdfjs-dist",
-      "legacy",
-      "build",
-      "pdf.worker.mjs"
-    );
+  const pdfjs = require("pdfjs-dist/build/pdf.js") as {
+    getDocument: (params: {
+      data: Uint8Array;
+      useWorkerFetch?: boolean;
+      disableFontFace?: boolean;
+    }) => {
+      promise: Promise<{
+        numPages: number;
+        getPage: (n: number) => Promise<{
+          getTextContent: () => Promise<{
+            items: Array<{ str?: string }>;
+          }>;
+          cleanup: () => void;
+        }>;
+        destroy: () => Promise<void>;
+      }>;
+      onPassword: ((fn: () => void) => void) | null;
+    };
+    GlobalWorkerOptions: { workerSrc: string };
+  };
 
-  const { getDocument, GlobalWorkerOptions } = await import(
-    "pdfjs-dist/legacy/build/pdf.mjs"
+  // workerSrc を CJS の require.resolve で設定（3.x は .js なので問題なし）
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  pdfjs.GlobalWorkerOptions.workerSrc = require.resolve(
+    "pdfjs-dist/build/pdf.worker.js"
   );
-  GlobalWorkerOptions.workerSrc = workerSrc;
 
   const TIMEOUT_MS = 25_000; // 25 秒タイムアウト
   const MAX_PAGES = 150; // 最大 150 ページ
 
   const parsePromise = (async () => {
-    const task = getDocument({
+    const task = pdfjs.getDocument({
       data: new Uint8Array(buffer),
       useWorkerFetch: false, // ネットワークフェッチを無効化
       disableFontFace: true, // テキスト抽出のみ：フォント読み込み省略
     });
-
-    // パスワード保護された PDF への対応（パスワード不要として処理）
-    task.onPassword = () => {
-      throw new Error(
-        "パスワードで保護された PDF は現在サポートされていません。"
-      );
-    };
 
     const pdfDoc = await task.promise;
 
@@ -107,9 +109,8 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
         try {
           const page = await pdfDoc.getPage(i);
           const textContent = await page.getTextContent();
-          // TextItem has `str`, TextMarkedContent does not — skip markers
           const text = textContent.items
-            .map((item) => ("str" in item ? (item as { str: string }).str : ""))
+            .map((item) => item.str ?? "")
             .join(" ");
           pageTexts.push(text.trim());
           page.cleanup();
@@ -121,7 +122,7 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
 
       return pageTexts.filter(Boolean).join("\n\n");
     } finally {
-      // doc.destroy() を必ず await — これが unhandledRejection の根本原因だった
+      // doc.destroy() を必ず await（pdf-parse が await しないため問題だった）
       await pdfDoc.destroy();
     }
   })();
