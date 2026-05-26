@@ -57,18 +57,10 @@ export async function extractText(
 async function extractFromPDF(buffer: Buffer): Promise<string> {
   // ── pdf-parse でインライン解析（worker ファイル不要）─────────────────────
   //
-  // pdfjs の内部クリーンアップが unhandledRejection を発生させることがある。
-  // Node.js 15+ はデフォルトで unhandledRejection をプロセス終了扱いにするため
-  // PDF 解析の間だけ一時的にハンドラを追加してプロセスクラッシュを防ぐ。
+  // pdf-parse は pdfjs v2.x を内包し workerSrc=false のインラインモードで動作。
+  // pdfjs の非同期クリーンアップによる unhandledRejection は
+  // route.ts のプロセスレベル永続ハンドラで捕捉される。
   //
-  // スコープを PDF 解析中に限定することで、他の処理の unhandledRejection を
-  // 隠蔽しないようにしている。
-  const absorbedRejections: unknown[] = [];
-  const rejectionHandler = (reason: unknown) => {
-    absorbedRejections.push(reason);
-  };
-  process.on("unhandledRejection", rejectionHandler);
-
   // タイムアウトタイマーの参照を保持し、finally で必ず clearTimeout する。
   // clearTimeout しないと 25 秒後に reject() が発火して unhandledRejection になる。
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -98,21 +90,6 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
     // タイムアウトタイマーをキャンセル（unhandledRejection リーク防止）
     if (timeoutId !== undefined) {
       clearTimeout(timeoutId);
-    }
-
-    // pdfjs の非同期クリーンアップが完了するまで待ってからハンドラを解除する。
-    // setTimeout(50ms) で現在の I/O コールバック・マイクロタスク・macrotask が
-    // 完了するのを待ち、pdfjs 内部の非同期後始末を吸収できるウィンドウを確保する。
-    await new Promise<void>((resolve) => setTimeout(resolve, 50));
-    process.removeListener("unhandledRejection", rejectionHandler);
-
-    if (absorbedRejections.length > 0) {
-      console.warn(
-        `[extractFromPDF] ${absorbedRejections.length} unhandledRejection(s) absorbed:`,
-        absorbedRejections.map((r) =>
-          r instanceof Error ? r.message : String(r)
-        )
-      );
     }
   }
 }
