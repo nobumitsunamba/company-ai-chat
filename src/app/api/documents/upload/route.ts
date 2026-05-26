@@ -16,32 +16,35 @@ export const dynamic = "force-dynamic";
 //
 // タイミングの問題:
 //   1ファイル目の処理後に pdfjs が 50ms 以上後にクリーンアップタイマーを発火
-//   → スコープ付きハンドラのウィンドウを外れて unhandledRejection が素通りする
 //   → Node.js 15+ はデフォルトで unhandledRejection をプロセス終了扱い
 //   → 2ファイル目の処理中にプロセスがクラッシュ → 500 HTML が返る
 //
 // 解決: モジュールロード時に一度だけ永続的なハンドラをインストールして
 //       プロセスのクラッシュを防ぐ。ハンドラはエラーをログに記録して継続する。
+//
+// 注意: process.listenerCount() チェックは使わない。
+//       Next.js が既にリスナーを持つ場合にスキップしてしまう可能性があるため
+//       モジュールレベルフラグで一度だけインストールする。
 // ────────────────────────────────────────────────────────────────────────────────
-(function installCrashGuard() {
-  // 多重インストールを防ぐ（モジュールキャッシュがある限り1回だけ実行される）
-  if (process.listenerCount("unhandledRejection") > 0) return;
+let _crashGuardInstalled = false;
+if (!_crashGuardInstalled) {
+  _crashGuardInstalled = true;
 
   process.on("unhandledRejection", (reason: unknown) => {
     // pdfjs / pdf-parse のクリーンアップ由来の rejection はログに残して継続
+    // process.exit() を呼ばない → プロセスを維持して次リクエストを処理できるようにする
     console.error(
       "[upload] unhandledRejection (PDF クリーンアップ由来の可能性):",
       reason instanceof Error ? reason.message : String(reason)
     );
-    // process.exit() を呼ばない → プロセスを維持して次リクエストを処理できるようにする
   });
 
   process.on("uncaughtException", (err: Error) => {
     // 通常は発生しないが、念のためログに残して継続
-    console.error("[upload] uncaughtException:", err.message);
+    console.error("[upload] uncaughtException:", err.message, err.stack);
     // 致命的な例外は再スローしない → プロセスを維持する
   });
-})();
+}
 
 /** 1ドキュメントあたりのチャンク上限 */
 const MAX_CHUNKS = 500;
