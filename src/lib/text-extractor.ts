@@ -61,10 +61,36 @@ export async function extractText(
 }
 
 async function extractFromPDF(buffer: Buffer): Promise<string> {
-  // ── pdf-parse でインライン解析（worker ファイル不要）─────────────────────
+  // ── OOM 根本原因と修正方針 ─────────────────────────────────────────────────
   //
-  // タイムアウトタイマーの参照を保持し finally で必ず clearTimeout する。
-  // clearTimeout しないと 25 秒後に reject() が発火して unhandledRejection になる。
+  // ■ 根本原因（Vercel OOM の真因）
+  //   pdfjs v1.10.100 は起動時に global.PDFJS をそのまま内部設定として使う。
+  //   (pdf.js:14173: if (!_global_scope2.default.PDFJS) { _global_scope2.default.PDFJS = {}; })
+  //   つまり global.PDFJS === pdfjs 内部の PDFJS オブジェクト。
+  //
+  //   disableFontFace を設定しない場合、CJK CID フォントを処理する際に
+  //   FontFaceObject.createFontFaceRule() が呼ばれ、以下が生成される：
+  //     bytesToString(new Uint8Array(fontBinary))  → 大きな Latin-1 文字列
+  //     btoa(上記文字列)                          → さらに大きな base64 文字列
+  //     "@font-face { ... }" CSS ルール            → 結合された巨大文字列
+  //
+  //   その後 insertRule() が Node.js で document 未定義のため例外を投げ、
+  //   fontReady コールバックが loadingContext.requests に残ったまま解放されない。
+  //   これが 1800MB OOM の原因。
+  //
+  // ■ 修正
+  //   require("pdf-parse") 呼び出し前に global.PDFJS に disableFontFace: true を
+  //   設定する。pdfjs はモジュール初期化時に global.PDFJS を読み込むため、
+  //   createFontFaceRule() が即座に null を返し、大きな文字列生成と
+  //   loadingContext.requests へのリークが発生しない。
+  //
+  // ■ その他の設定
+  //   disableAutoFetch / disableStream / disableRange:
+  //     バッファ渡しでは無関係だが Range-fetch 関連の副作用を念のため抑止。
+  //   disableCreateObjectURL:
+  //     Node.js で URL.createObjectURL を使う試みをブロック。
+  //   cMapUrl = null / cMapPacked = false:
+  //     CMap 外部フェッチを即座に reject → 未完了 Promise をなくす。
   // ──────────────────────────────────────────────────────────────────────────────
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -75,24 +101,17 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
   });
 
   const parsePromise = (async () => {
-    // ── pdfjs v1.10.100 の CMap 非同期フェッチを無効化 ────────────────────────
-    //
-    // pdfjs v1.10.100 は global.PDFJS オブジェクトを設定として参照する。
-    // デフォルトでは disableAutoFetch / disableStream / disableRange が false のため、
-    // CID フォント（CJK 複合フォント）を含む PDF を処理する際に
-    // XMLHttpRequest で CMap ファイルを非同期フェッチしようとする。
-    //
-    // Node.js 環境には XMLHttpRequest が存在しないため、フェッチは失敗するが
-    // 内部タイマーがリークして 30 秒後に OOM / SIGABRT を引き起こす。
-    //
-    // 対策: pdf-parse を呼ぶ前に global.PDFJS でフェッチ系機能を無効化する。
-    // ──────────────────────────────────────────────────────────────────────────
+    // pdfjs が global.PDFJS を内部 PDFJS として使うため、require より前に設定する
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const g = global as any;
-    g.PDFJS = g.PDFJS || {};
-    g.PDFJS.disableAutoFetch = true;
-    g.PDFJS.disableStream = true;
-    g.PDFJS.disableRange = true;
+    g.PDFJS                        = g.PDFJS || {};
+    g.PDFJS.disableAutoFetch       = true;
+    g.PDFJS.disableStream          = true;
+    g.PDFJS.disableRange           = true;
+    g.PDFJS.disableFontFace        = true;  // ← 根本修正: 大きな base64 生成を防ぐ
+    g.PDFJS.disableCreateObjectURL = true;
+    g.PDFJS.cMapUrl                = null;
+    g.PDFJS.cMapPacked             = false;
 
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const pdfParse = require("pdf-parse") as (
