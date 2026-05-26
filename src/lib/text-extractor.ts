@@ -1,13 +1,23 @@
 /**
  * Text extraction from various file formats.
- * Supports: PDF, DOCX, TXT, MD
+ * Supports: PDF, DOCX, TXT, MD, CSV
  *
- * PDF 抽出には pdfjs-dist 5.x を直接使用する。
- *   - pdfjs-dist は doc.destroy() を正しく await できるため後片付け漏れがない。
- *   - isEvalSupported: false でサーバーレス環境での eval() を無効化。
- *   - disableFontFace: true でフォント DL を省略（テキスト抽出のみ）。
- *   - ページ単位の try-catch でパース失敗ページをスキップ。
- *   - workerSrc に require.resolve() で絶対パスを渡す（Vercel でも動作）。
+ * PDF 抽出には pdfjs-dist/legacy/build/pdf.js を使用する。
+ *
+ * ■ なぜ legacy ビルドを使うのか
+ *   - pdfjs-dist の標準ビルド (build/pdf.js) は Web Worker を前提としており、
+ *     Node.js 環境では "Setting up fake worker failed" エラーになる。
+ *   - legacy ビルドは CJS 互換で、Node.js を自動検出してメインスレッドで動作する。
+ *   - pdf-parse (pdfjs v1.10.100) は古く、特定の PDF (CID フォント 2 フォント使用等) で
+ *     Vercel 環境のみ失敗するケースがあった。legacy v3.11.x では解消されている。
+ *
+ * ■ 注意点
+ *   - canvas モジュールは不要（テキスト抽出のみ）。
+ *     起動時の Warning は無害なので verbosity=0 で抑制する。
+ *   - 各 PDF 処理後に doc.cleanup() + doc.destroy() を呼び、
+ *     リソースリークや unhandledRejection を防ぐ。
+ *   - タイムアウト Promise は必ず clearTimeout して
+ *     タイマー由来の unhandledRejection を防ぐ。
  */
 
 export async function extractText(
@@ -50,99 +60,95 @@ export async function extractText(
 }
 
 async function extractFromPDF(buffer: Buffer): Promise<string> {
-  // ── pdfjs-dist 3.x を直接使用 ──────────────────────────────────────────
-  // pdf-parse (pdf.js v1.10.100) の問題点：
-  //   ① doc.destroy() を await せず → 後片付けが非同期で失敗して unhandledRejection
-  //   ② モジュール変数 PDFJS を使い回す → 複雑な PDF 後に状態汚染
-  //   ③ CJK フォント（日本語）のサポートが不完全
+  // ── pdfjs-dist legacy ビルドで PDF テキスト抽出 ────────────────────────────
   //
-  // pdfjs-dist 5.x は DOMMatrix など browser-only API を必要とし Node.js では動かない。
-  // pdfjs-dist 3.x は CJS 形式で DOMMatrix 不要、Node.js/Vercel で安定動作する。
+  // ★ 重要: pdfjs はモジュールレベルでグローバル状態を保持する。
+  //   1ファイル目の処理後に残ったキャッシュ・内部状態が
+  //   2ファイル目の処理（特に複数フォントのPDF）に干渉してクラッシュを起こす。
+  //   → require.cache からすべての pdfjs-dist エントリを削除して
+  //     毎回フレッシュなインスタンスをロードすることで状態汚染を防ぐ。
   //
-  // workerSrc: 3.x は .js (CJS) なので require.resolve が使える
-  //   (webpack が ESM として拒否しない)。
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const pdfjs = require("pdfjs-dist/build/pdf.js") as {
-    getDocument: (params: {
-      data: Uint8Array;
-      useWorkerFetch?: boolean;
-      disableFontFace?: boolean;
-    }) => {
-      promise: Promise<{
-        numPages: number;
-        getPage: (n: number) => Promise<{
-          getTextContent: () => Promise<{
-            items: Array<{ str?: string }>;
-          }>;
-          cleanup: () => void;
-        }>;
-        destroy: () => Promise<void>;
-      }>;
-      onPassword: ((fn: () => void) => void) | null;
-    };
-    GlobalWorkerOptions: { workerSrc: string };
-  };
-
-  // workerSrc: require.resolve() は webpack がビルド時に module ID（数値）へ置換するため
-  // pdfjs の内部で .endsWith() を呼ぶと "not a function" エラーになる。
-  // path.join(process.cwd(), ...) はビルド時に静的解析されず、実行時に正しい絶対パスを返す。
-  // Vercel での process.cwd() は /var/task（プロジェクトルート）。
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const nodePath = require("path") as typeof import("path");
-  pdfjs.GlobalWorkerOptions.workerSrc = nodePath.join(
-    process.cwd(),
-    "node_modules",
-    "pdfjs-dist",
-    "build",
-    "pdf.worker.js"
-  );
-
-  const TIMEOUT_MS = 25_000; // 25 秒タイムアウト
-  const MAX_PAGES = 150; // 最大 150 ページ
+  // ★ メモリ: disableFontFace: true により OOM を防止
+  //   (デフォルト有効だと Vercel Lambda で 1.8GB のヒープを消費する)
+  //
+  // タイムアウトタイマーの参照を保持し finally で必ず clearTimeout する。
+  // ──────────────────────────────────────────────────────────────────────────────
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(
+      () => reject(new Error("PDF解析がタイムアウトしました（25秒超）")),
+      25_000
+    );
+  });
 
   const parsePromise = (async () => {
-    const task = pdfjs.getDocument({
+    // pdfjs-dist のモジュールキャッシュをクリアして新鮮な状態でロード
+    // （リクエスト間のグローバル状態汚染を防ぐ）
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const cacheKeys = Object.keys(require.cache).filter((k) =>
+      k.includes("pdfjs-dist")
+    );
+    for (const key of cacheKeys) {
+      delete require.cache[key];
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js") as {
+      getDocument: (params: Record<string, unknown>) => { promise: Promise<PDFDocument> };
+    };
+
+    type PDFDocument = {
+      numPages: number;
+      getPage: (n: number) => Promise<PDFPage>;
+      cleanup: () => Promise<void>;
+      destroy: () => Promise<void>;
+    };
+    type PDFPage = {
+      getTextContent: () => Promise<{ items: Array<{ str: string; hasEOL?: boolean }> }>;
+      cleanup: () => Promise<void>;
+    };
+
+    const task = pdfjsLib.getDocument({
       data: new Uint8Array(buffer),
-      useWorkerFetch: false, // ネットワークフェッチを無効化
-      disableFontFace: true, // テキスト抽出のみ：フォント読み込み省略
+      useSystemFonts: true,     // システムフォントを使用（CMaps 取得不要）
+      verbosity: 0,              // canvas 関連 Warning を抑制
+      disableFontFace: true,     // ★ フォントフェイス描画を無効化 → メモリ使用量を大幅削減
+                                 //    (デフォルト有効だと1.8GBのOOMが発生する)
+      standardFontDataUrl: null, // 標準フォントデータURLなし（ネットワーク取得しない）
+      isEvalSupported: false,    // eval 無効（セキュリティ強化）
+      useWorkerFetch: false,     // ワーカー経由のフェッチを無効
     });
 
-    const pdfDoc = await task.promise;
+    const doc = await task.promise;
+    let text = "";
 
     try {
-      const numPages = Math.min(pdfDoc.numPages, MAX_PAGES);
-      const pageTexts: string[] = [];
-
-      for (let i = 1; i <= numPages; i++) {
-        try {
-          const page = await pdfDoc.getPage(i);
-          const textContent = await page.getTextContent();
-          const text = textContent.items
-            .map((item) => item.str ?? "")
-            .join(" ");
-          pageTexts.push(text.trim());
-          page.cleanup();
-        } catch {
-          // パース失敗ページはスキップして続行
-          pageTexts.push("");
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const content = await page.getTextContent();
+        for (const item of content.items) {
+          text += item.str;
+          if (item.hasEOL) text += "\n";
         }
+        // cleanup() は Promise を返さないバージョンもあるため try-catch のみ
+        try { page.cleanup(); } catch { /* ignore */ }
       }
-
-      return pageTexts.filter(Boolean).join("\n\n");
     } finally {
-      // doc.destroy() を必ず await（pdf-parse が await しないため問題だった）
-      await pdfDoc.destroy();
+      try { doc.cleanup(); } catch { /* ignore */ }
+      try { await doc.destroy(); } catch { /* ignore */ }
     }
+
+    return text;
   })();
 
-  const timeoutPromise = new Promise<never>((_, reject) =>
-    setTimeout(
-      () => reject(new Error("PDF解析がタイムアウトしました（25秒超）")),
-      TIMEOUT_MS
-    )
-  );
-
-  return Promise.race([parsePromise, timeoutPromise]);
+  try {
+    return await Promise.race([parsePromise, timeoutPromise]);
+  } finally {
+    // タイムアウトタイマーをキャンセル（unhandledRejection リーク防止）
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
 }
 
 async function extractFromDocx(buffer: Buffer): Promise<string> {

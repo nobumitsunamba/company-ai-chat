@@ -9,6 +9,43 @@ export const maxDuration = 60;
 // キャッシュを無効化し、常に動的にルートを処理する
 export const dynamic = "force-dynamic";
 
+// ─── プロセスクラッシュ防止 ────────────────────────────────────────────────────
+//
+// PDF ライブラリ（pdf-parse が内包する pdfjs）の非同期クリーンアップは
+// unhandledRejection を発生させることがある。
+//
+// タイミングの問題:
+//   1ファイル目の処理後に pdfjs が 50ms 以上後にクリーンアップタイマーを発火
+//   → Node.js 15+ はデフォルトで unhandledRejection をプロセス終了扱い
+//   → 2ファイル目の処理中にプロセスがクラッシュ → 500 HTML が返る
+//
+// 解決: モジュールロード時に一度だけ永続的なハンドラをインストールして
+//       プロセスのクラッシュを防ぐ。ハンドラはエラーをログに記録して継続する。
+//
+// 注意: process.listenerCount() チェックは使わない。
+//       Next.js が既にリスナーを持つ場合にスキップしてしまう可能性があるため
+//       モジュールレベルフラグで一度だけインストールする。
+// ────────────────────────────────────────────────────────────────────────────────
+let _crashGuardInstalled = false;
+if (!_crashGuardInstalled) {
+  _crashGuardInstalled = true;
+
+  process.on("unhandledRejection", (reason: unknown) => {
+    // pdfjs / pdf-parse のクリーンアップ由来の rejection はログに残して継続
+    // process.exit() を呼ばない → プロセスを維持して次リクエストを処理できるようにする
+    console.error(
+      "[upload] unhandledRejection (PDF クリーンアップ由来の可能性):",
+      reason instanceof Error ? reason.message : String(reason)
+    );
+  });
+
+  process.on("uncaughtException", (err: Error) => {
+    // 通常は発生しないが、念のためログに残して継続
+    console.error("[upload] uncaughtException:", err.message, err.stack);
+    // 致命的な例外は再スローしない → プロセスを維持する
+  });
+}
+
 /** 1ドキュメントあたりのチャンク上限 */
 const MAX_CHUNKS = 500;
 
@@ -98,7 +135,9 @@ async function handleUpload(req: NextRequest): Promise<NextResponse> {
   // ── テキスト抽出 ─────────────────────────────────────────────────────────
   let text: string;
   try {
+    console.log(`[upload] extractText start: ${file.name} (${file.size}B, ${file.type})`);
     text = await extractText(buffer, file.type, file.name);
+    console.log(`[upload] extractText done: ${text.length} chars`);
   } catch (err) {
     console.error("[upload] Text extraction error:", err);
     return jsonError(
@@ -148,6 +187,7 @@ async function handleUpload(req: NextRequest): Promise<NextResponse> {
   }
 
   // ── 成功レスポンス ────────────────────────────────────────────────────────
+  console.log(`[upload] success: ${file.name}, chunks=${chunks.length}`);
   // chunks をクライアントに返す → ブラウザ localStorage で保持 → チャット時に送信
   return NextResponse.json({
     ...doc,
