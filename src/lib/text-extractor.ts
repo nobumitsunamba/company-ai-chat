@@ -108,19 +108,17 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
     try {
       for (let i = 1; i <= doc.numPages; i++) {
         const page = await doc.getPage(i);
-        try {
-          const content = await page.getTextContent();
-          for (const item of content.items) {
-            text += item.str;
-            if (item.hasEOL) text += "\n";
-          }
-        } finally {
-          await page.cleanup().catch(() => {});
+        const content = await page.getTextContent();
+        for (const item of content.items) {
+          text += item.str;
+          if (item.hasEOL) text += "\n";
         }
+        // cleanup() は Promise を返さないバージョンもあるため try-catch のみ
+        try { page.cleanup(); } catch { /* ignore */ }
       }
     } finally {
-      await doc.cleanup().catch(() => {});
-      await doc.destroy().catch(() => {});
+      try { doc.cleanup(); } catch { /* ignore */ }
+      try { await doc.destroy(); } catch { /* ignore */ }
     }
 
     return text;
