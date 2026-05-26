@@ -135,7 +135,9 @@ async function handleUpload(req: NextRequest): Promise<NextResponse> {
   // ── テキスト抽出 ─────────────────────────────────────────────────────────
   let text: string;
   try {
+    console.log(`[upload] extractText start: ${file.name} (${file.size}B, ${file.type})`);
     text = await extractText(buffer, file.type, file.name);
+    console.log(`[upload] extractText done: ${text.length} chars`);
   } catch (err) {
     console.error("[upload] Text extraction error:", err);
     return jsonError(
@@ -185,6 +187,7 @@ async function handleUpload(req: NextRequest): Promise<NextResponse> {
   }
 
   // ── 成功レスポンス ────────────────────────────────────────────────────────
+  console.log(`[upload] success: ${file.name}, chunks=${chunks.length}`);
   // chunks をクライアントに返す → ブラウザ localStorage で保持 → チャット時に送信
   return NextResponse.json({
     ...doc,

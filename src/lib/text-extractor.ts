@@ -62,8 +62,14 @@ export async function extractText(
 async function extractFromPDF(buffer: Buffer): Promise<string> {
   // ── pdfjs-dist legacy ビルドで PDF テキスト抽出 ────────────────────────────
   //
-  // legacy ビルドは Node.js を自動検出してメインスレッドで動作する。
-  // ワーカー設定不要。canvas 不要（テキスト抽出のみ）。
+  // ★ 重要: pdfjs はモジュールレベルでグローバル状態を保持する。
+  //   1ファイル目の処理後に残ったキャッシュ・内部状態が
+  //   2ファイル目の処理（特に複数フォントのPDF）に干渉してクラッシュを起こす。
+  //   → require.cache からすべての pdfjs-dist エントリを削除して
+  //     毎回フレッシュなインスタンスをロードすることで状態汚染を防ぐ。
+  //
+  // ★ メモリ: disableFontFace: true により OOM を防止
+  //   (デフォルト有効だと Vercel Lambda で 1.8GB のヒープを消費する)
   //
   // タイムアウトタイマーの参照を保持し finally で必ず clearTimeout する。
   // ──────────────────────────────────────────────────────────────────────────────
@@ -76,7 +82,16 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
   });
 
   const parsePromise = (async () => {
+    // pdfjs-dist のモジュールキャッシュをクリアして新鮮な状態でロード
+    // （リクエスト間のグローバル状態汚染を防ぐ）
     // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const cacheKeys = Object.keys(require.cache).filter((k) =>
+      k.includes("pdfjs-dist")
+    );
+    for (const key of cacheKeys) {
+      delete require.cache[key];
+    }
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js") as {
       getDocument: (params: Record<string, unknown>) => { promise: Promise<PDFDocument> };
