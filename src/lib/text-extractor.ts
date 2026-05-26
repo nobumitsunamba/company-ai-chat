@@ -2,17 +2,22 @@
  * Text extraction from various file formats.
  * Supports: PDF, DOCX, TXT, MD, CSV
  *
- * PDF 抽出には pdf-parse を使用する。
- *   - pdf-parse は pdfjs v2.x を内包し workerSrc=false のインラインモードで動作
- *     → 別途 pdf.worker.js ファイルが不要（Vercel バンドル問題を完全回避）
- *   - pdfjs-dist 3.x を直接使う場合の問題点:
- *       ① nft が pdf.worker.js への動的参照を追跡できず Vercel デプロイに含まれない
- *       ② フェイクワーカーのクリーンアップが unhandledRejection を発生させる
- *          → Node.js 15+ がプロセスを終了 → 2ファイル目から 500 HTML になる
- *       ③ 同一プロセス内の2回目以降の呼び出しでワーカー状態が汚染される場合がある
- *   - pdf-parse も内部 pdfjs のクリーンアップで unhandledRejection を発生させることがある
- *     → PDF 解析中のみスコープ付きハンドラで吸収してプロセスクラッシュを防ぐ
- *   - タイムアウト Promise は必ず clearTimeout して unhandledRejection リークを防ぐ
+ * PDF 抽出には pdfjs-dist/legacy/build/pdf.js を使用する。
+ *
+ * ■ なぜ legacy ビルドを使うのか
+ *   - pdfjs-dist の標準ビルド (build/pdf.js) は Web Worker を前提としており、
+ *     Node.js 環境では "Setting up fake worker failed" エラーになる。
+ *   - legacy ビルドは CJS 互換で、Node.js を自動検出してメインスレッドで動作する。
+ *   - pdf-parse (pdfjs v1.10.100) は古く、特定の PDF (CID フォント 2 フォント使用等) で
+ *     Vercel 環境のみ失敗するケースがあった。legacy v3.11.x では解消されている。
+ *
+ * ■ 注意点
+ *   - canvas モジュールは不要（テキスト抽出のみ）。
+ *     起動時の Warning は無害なので verbosity=0 で抑制する。
+ *   - 各 PDF 処理後に doc.cleanup() + doc.destroy() を呼び、
+ *     リソースリークや unhandledRejection を防ぐ。
+ *   - タイムアウト Promise は必ず clearTimeout して
+ *     タイマー由来の unhandledRejection を防ぐ。
  */
 
 export async function extractText(
@@ -55,14 +60,13 @@ export async function extractText(
 }
 
 async function extractFromPDF(buffer: Buffer): Promise<string> {
-  // ── pdf-parse でインライン解析（worker ファイル不要）─────────────────────
+  // ── pdfjs-dist legacy ビルドで PDF テキスト抽出 ────────────────────────────
   //
-  // pdf-parse は pdfjs v2.x を内包し workerSrc=false のインラインモードで動作。
-  // pdfjs の非同期クリーンアップによる unhandledRejection は
-  // route.ts のプロセスレベル永続ハンドラで捕捉される。
+  // legacy ビルドは Node.js を自動検出してメインスレッドで動作する。
+  // ワーカー設定不要。canvas 不要（テキスト抽出のみ）。
   //
-  // タイムアウトタイマーの参照を保持し、finally で必ず clearTimeout する。
-  // clearTimeout しないと 25 秒後に reject() が発火して unhandledRejection になる。
+  // タイムアウトタイマーの参照を保持し finally で必ず clearTimeout する。
+  // ──────────────────────────────────────────────────────────────────────────────
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(
@@ -73,15 +77,53 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
 
   const parsePromise = (async () => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const pdfParse = require("pdf-parse") as (
-      dataBuffer: Buffer,
-      options?: { max?: number }
-    ) => Promise<{ text: string; numpages: number }>;
+    const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js") as {
+      getDocument: (params: {
+        data: Uint8Array;
+        useSystemFonts: boolean;
+        verbosity: number;
+      }) => { promise: Promise<PDFDocument> };
+    };
 
-    const result = await pdfParse(buffer, {
-      max: 150, // 最大 150 ページ
+    type PDFDocument = {
+      numPages: number;
+      getPage: (n: number) => Promise<PDFPage>;
+      cleanup: () => Promise<void>;
+      destroy: () => Promise<void>;
+    };
+    type PDFPage = {
+      getTextContent: () => Promise<{ items: Array<{ str: string; hasEOL?: boolean }> }>;
+      cleanup: () => Promise<void>;
+    };
+
+    const task = pdfjsLib.getDocument({
+      data: new Uint8Array(buffer),
+      useSystemFonts: true,  // システムフォントを使用（CMaps 取得不要）
+      verbosity: 0,           // canvas 関連 Warning を抑制
     });
-    return result.text;
+
+    const doc = await task.promise;
+    let text = "";
+
+    try {
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        try {
+          const content = await page.getTextContent();
+          for (const item of content.items) {
+            text += item.str;
+            if (item.hasEOL) text += "\n";
+          }
+        } finally {
+          await page.cleanup().catch(() => {});
+        }
+      }
+    } finally {
+      await doc.cleanup().catch(() => {});
+      await doc.destroy().catch(() => {});
+    }
+
+    return text;
   })();
 
   try {
