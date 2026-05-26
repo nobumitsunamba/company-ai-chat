@@ -14,6 +14,24 @@ const nextConfig = {
       "mammoth",
       "@vercel/kv",
     ],
+
+    // pdfjs-dist の pdf.worker.js を Vercel デプロイに明示的に含める。
+    //
+    // 問題: Vercel の nft（node-file-tracer）は静的な require() しか追跡しない。
+    //       pdf.worker.js は GlobalWorkerOptions.workerSrc に実行時動的セットされるため
+    //       nft に検出されず、Vercel サーバーレス関数バンドルに含まれない。
+    //       その結果 /var/task/node_modules/pdfjs-dist/build/pdf.worker.js が存在せず
+    //       "Setting up fake worker failed: Cannot find module" エラーが発生する。
+    //
+    // 解決: outputFileTracingIncludes でワーカーファイルを強制的に含める。
+    //       これにより pdf.worker.js が /var/task/node_modules/pdfjs-dist/build/ に
+    //       配置され、path.join(process.cwd(), ...) で参照できるようになる。
+    outputFileTracingIncludes: {
+      "/api/documents/upload": [
+        "./node_modules/pdfjs-dist/build/pdf.worker.js",
+        "./node_modules/pdfjs-dist/build/pdf.worker.js.map",
+      ],
+    },
   },
 };
 
