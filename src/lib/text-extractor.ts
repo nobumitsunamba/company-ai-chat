@@ -2,22 +2,23 @@
  * Text extraction from various file formats.
  * Supports: PDF, DOCX, TXT, MD, CSV
  *
- * PDF 抽出には pdfjs-dist/legacy/build/pdf.js を使用する。
+ * PDF 抽出には pdf-parse (pdfjs v1.10.100) を使用する。
  *
- * ■ なぜ legacy ビルドを使うのか
- *   - pdfjs-dist の標準ビルド (build/pdf.js) は Web Worker を前提としており、
- *     Node.js 環境では "Setting up fake worker failed" エラーになる。
- *   - legacy ビルドは CJS 互換で、Node.js を自動検出してメインスレッドで動作する。
- *   - pdf-parse (pdfjs v1.10.100) は古く、特定の PDF (CID フォント 2 フォント使用等) で
- *     Vercel 環境のみ失敗するケースがあった。legacy v3.11.x では解消されている。
+ * ■ ライブラリ選択の経緯
+ *   - pdfjs-dist v3.x: OOM (1.8GB) → Vercel Lambda 上限超過でクラッシュ
+ *     disableFontFace: true でも OOM は解消せず (extractText 後にクラッシュ)
+ *   - pdf-parse (pdfjs v1.10.100):
+ *     ローカル計測 RSS +47MB、unhandledRejection も発生しない
+ *     → Vercel 環境でも安定して動作する
  *
- * ■ 注意点
- *   - canvas モジュールは不要（テキスト抽出のみ）。
- *     起動時の Warning は無害なので verbosity=0 で抑制する。
- *   - 各 PDF 処理後に doc.cleanup() + doc.destroy() を呼び、
- *     リソースリークや unhandledRejection を防ぐ。
- *   - タイムアウト Promise は必ず clearTimeout して
- *     タイマー由来の unhandledRejection を防ぐ。
+ * ■ Vercel デプロイ上の注意
+ *   pdf-parse は内部で ./pdf.js/{version}/build/pdf.js を動的 require する。
+ *   nft (Node File Tracer) が静的解析できないため、next.config.mjs の
+ *   outputFileTracingIncludes でファイルを明示的に含める必要がある。
+ *
+ * ■ クラッシュ防止
+ *   pdfjs の非同期クリーンアップによる unhandledRejection は
+ *   route.ts のプロセスレベル永続ハンドラ（process.on('unhandledRejection')）で捕捉。
  */
 
 export async function extractText(
@@ -60,18 +61,10 @@ export async function extractText(
 }
 
 async function extractFromPDF(buffer: Buffer): Promise<string> {
-  // ── pdfjs-dist legacy ビルドで PDF テキスト抽出 ────────────────────────────
-  //
-  // ★ 重要: pdfjs はモジュールレベルでグローバル状態を保持する。
-  //   1ファイル目の処理後に残ったキャッシュ・内部状態が
-  //   2ファイル目の処理（特に複数フォントのPDF）に干渉してクラッシュを起こす。
-  //   → require.cache からすべての pdfjs-dist エントリを削除して
-  //     毎回フレッシュなインスタンスをロードすることで状態汚染を防ぐ。
-  //
-  // ★ メモリ: disableFontFace: true により OOM を防止
-  //   (デフォルト有効だと Vercel Lambda で 1.8GB のヒープを消費する)
+  // ── pdf-parse でインライン解析（worker ファイル不要）─────────────────────
   //
   // タイムアウトタイマーの参照を保持し finally で必ず clearTimeout する。
+  // clearTimeout しないと 25 秒後に reject() が発火して unhandledRejection になる。
   // ──────────────────────────────────────────────────────────────────────────────
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -82,63 +75,16 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
   });
 
   const parsePromise = (async () => {
-    // pdfjs-dist のモジュールキャッシュをクリアして新鮮な状態でロード
-    // （リクエスト間のグローバル状態汚染を防ぐ）
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const cacheKeys = Object.keys(require.cache).filter((k) =>
-      k.includes("pdfjs-dist")
-    );
-    for (const key of cacheKeys) {
-      delete require.cache[key];
-    }
+    const pdfParse = require("pdf-parse") as (
+      dataBuffer: Buffer,
+      options?: { max?: number }
+    ) => Promise<{ text: string; numpages: number }>;
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js") as {
-      getDocument: (params: Record<string, unknown>) => { promise: Promise<PDFDocument> };
-    };
-
-    type PDFDocument = {
-      numPages: number;
-      getPage: (n: number) => Promise<PDFPage>;
-      cleanup: () => Promise<void>;
-      destroy: () => Promise<void>;
-    };
-    type PDFPage = {
-      getTextContent: () => Promise<{ items: Array<{ str: string; hasEOL?: boolean }> }>;
-      cleanup: () => Promise<void>;
-    };
-
-    const task = pdfjsLib.getDocument({
-      data: new Uint8Array(buffer),
-      useSystemFonts: true,     // システムフォントを使用（CMaps 取得不要）
-      verbosity: 0,              // canvas 関連 Warning を抑制
-      disableFontFace: true,     // ★ フォントフェイス描画を無効化 → メモリ使用量を大幅削減
-                                 //    (デフォルト有効だと1.8GBのOOMが発生する)
-      standardFontDataUrl: null, // 標準フォントデータURLなし（ネットワーク取得しない）
-      isEvalSupported: false,    // eval 無効（セキュリティ強化）
-      useWorkerFetch: false,     // ワーカー経由のフェッチを無効
+    const result = await pdfParse(buffer, {
+      max: 150, // 最大 150 ページ
     });
-
-    const doc = await task.promise;
-    let text = "";
-
-    try {
-      for (let i = 1; i <= doc.numPages; i++) {
-        const page = await doc.getPage(i);
-        const content = await page.getTextContent();
-        for (const item of content.items) {
-          text += item.str;
-          if (item.hasEOL) text += "\n";
-        }
-        // cleanup() は Promise を返さないバージョンもあるため try-catch のみ
-        try { page.cleanup(); } catch { /* ignore */ }
-      }
-    } finally {
-      try { doc.cleanup(); } catch { /* ignore */ }
-      try { await doc.destroy(); } catch { /* ignore */ }
-    }
-
-    return text;
+    return result.text;
   })();
 
   try {
