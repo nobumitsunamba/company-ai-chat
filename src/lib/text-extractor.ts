@@ -77,12 +77,9 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
 
   const parsePromise = (async () => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const pdfjsLib = require("pdfjs-dist/legacy/build/pdf.js") as {
-      getDocument: (params: {
-        data: Uint8Array;
-        useSystemFonts: boolean;
-        verbosity: number;
-      }) => { promise: Promise<PDFDocument> };
+      getDocument: (params: Record<string, unknown>) => { promise: Promise<PDFDocument> };
     };
 
     type PDFDocument = {
@@ -98,8 +95,13 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
 
     const task = pdfjsLib.getDocument({
       data: new Uint8Array(buffer),
-      useSystemFonts: true,  // システムフォントを使用（CMaps 取得不要）
-      verbosity: 0,           // canvas 関連 Warning を抑制
+      useSystemFonts: true,     // システムフォントを使用（CMaps 取得不要）
+      verbosity: 0,              // canvas 関連 Warning を抑制
+      disableFontFace: true,     // ★ フォントフェイス描画を無効化 → メモリ使用量を大幅削減
+                                 //    (デフォルト有効だと1.8GBのOOMが発生する)
+      standardFontDataUrl: null, // 標準フォントデータURLなし（ネットワーク取得しない）
+      isEvalSupported: false,    // eval 無効（セキュリティ強化）
+      useWorkerFetch: false,     // ワーカー経由のフェッチを無効
     });
 
     const doc = await task.promise;
