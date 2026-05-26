@@ -75,6 +75,25 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
   });
 
   const parsePromise = (async () => {
+    // ── pdfjs v1.10.100 の CMap 非同期フェッチを無効化 ────────────────────────
+    //
+    // pdfjs v1.10.100 は global.PDFJS オブジェクトを設定として参照する。
+    // デフォルトでは disableAutoFetch / disableStream / disableRange が false のため、
+    // CID フォント（CJK 複合フォント）を含む PDF を処理する際に
+    // XMLHttpRequest で CMap ファイルを非同期フェッチしようとする。
+    //
+    // Node.js 環境には XMLHttpRequest が存在しないため、フェッチは失敗するが
+    // 内部タイマーがリークして 30 秒後に OOM / SIGABRT を引き起こす。
+    //
+    // 対策: pdf-parse を呼ぶ前に global.PDFJS でフェッチ系機能を無効化する。
+    // ──────────────────────────────────────────────────────────────────────────
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const g = global as any;
+    g.PDFJS = g.PDFJS || {};
+    g.PDFJS.disableAutoFetch = true;
+    g.PDFJS.disableStream = true;
+    g.PDFJS.disableRange = true;
+
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const pdfParse = require("pdf-parse") as (
       dataBuffer: Buffer,
