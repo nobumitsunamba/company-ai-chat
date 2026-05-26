@@ -118,8 +118,9 @@ const { workerData, parentPort } = require('worker_threads');
     g.PDFJS.cMapUrl                = null;
     g.PDFJS.cMapPacked             = false;
 
-    // 絶対パスで require することで Vercel 環境でのモジュール解決の曖昧さをなくす
-    const pdfParse = require(workerData.pdfParsePath);
+    // worker thread 内では require は Node.js ネイティブのため
+    // パッケージ名で直接 require できる（webpack シムの影響を受けない）
+    const pdfParse = require('pdf-parse');
     const buf = Buffer.from(workerData.pdfBuffer);
     const result = await pdfParse(buf, { max: 150 });
     parentPort.postMessage({ ok: true, text: result.text });
@@ -141,8 +142,8 @@ const { workerData, parentPort } = require('worker_threads');
       eval: true,
       workerData: {
         pdfBuffer: arrayBuffer,
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        pdfParsePath: require.resolve("pdf-parse"),
+        // NOTE: require.resolve("pdf-parse") は webpack シムにより数値 ID を返すため使用不可。
+        // worker thread 内の require は Node.js ネイティブなので 'pdf-parse' で直接解決する。
       },
     });
 

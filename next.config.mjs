@@ -21,6 +21,8 @@ const nextConfig = {
     // nft (Node File Tracer) が静的解析できない → 手動で含める。
     outputFileTracingIncludes: {
       "/api/documents/upload": [
+        // worker thread から require('pdf-parse') を解決するために package.json が必要
+        "./node_modules/pdf-parse/package.json",
         "./node_modules/pdf-parse/lib/pdf.js/v1.10.100/build/pdf.js",
         "./node_modules/pdf-parse/lib/pdf.js/v1.10.100/build/pdf.worker.js",
         "./node_modules/pdf-parse/lib/pdf-parse.js",
