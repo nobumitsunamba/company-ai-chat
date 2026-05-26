@@ -1,13 +1,18 @@
 /**
  * Text extraction from various file formats.
- * Supports: PDF, DOCX, TXT, MD
+ * Supports: PDF, DOCX, TXT, MD, CSV
  *
- * PDF 抽出には pdfjs-dist 5.x を直接使用する。
- *   - pdfjs-dist は doc.destroy() を正しく await できるため後片付け漏れがない。
- *   - isEvalSupported: false でサーバーレス環境での eval() を無効化。
- *   - disableFontFace: true でフォント DL を省略（テキスト抽出のみ）。
- *   - ページ単位の try-catch でパース失敗ページをスキップ。
- *   - workerSrc に require.resolve() で絶対パスを渡す（Vercel でも動作）。
+ * PDF 抽出には pdf-parse を使用する。
+ *   - pdf-parse は pdfjs v2.x を内包し workerSrc=false のインラインモードで動作
+ *     → 別途 pdf.worker.js ファイルが不要（Vercel バンドル問題を完全回避）
+ *   - pdfjs-dist 3.x を直接使う場合の問題点:
+ *       ① nft が pdf.worker.js への動的参照を追跡できず Vercel デプロイに含まれない
+ *       ② フェイクワーカーのクリーンアップが unhandledRejection を発生させる
+ *          → Node.js 15+ がプロセスを終了 → 2ファイル目から 500 HTML になる
+ *       ③ 同一プロセス内の2回目以降の呼び出しでワーカー状態が汚染される場合がある
+ *   - pdf-parse も内部 pdfjs のクリーンアップで unhandledRejection を発生させることがある
+ *     → PDF 解析中のみスコープ付きハンドラで吸収してプロセスクラッシュを防ぐ
+ *   - タイムアウト Promise は必ず clearTimeout して unhandledRejection リークを防ぐ
  */
 
 export async function extractText(
@@ -50,114 +55,64 @@ export async function extractText(
 }
 
 async function extractFromPDF(buffer: Buffer): Promise<string> {
-  // ── pdfjs-dist 3.x を直接使用 ──────────────────────────────────────────
-  // pdf-parse (pdf.js v1.10.100) の問題点：
-  //   ① doc.destroy() を await せず → 後片付けが非同期で失敗して unhandledRejection
-  //   ② モジュール変数 PDFJS を使い回す → 複雑な PDF 後に状態汚染
-  //   ③ CJK フォント（日本語）のサポートが不完全
+  // ── pdf-parse でインライン解析（worker ファイル不要）─────────────────────
   //
-  // pdfjs-dist 5.x は DOMMatrix など browser-only API を必要とし Node.js では動かない。
-  // pdfjs-dist 3.x は CJS 形式で DOMMatrix 不要、Node.js/Vercel で安定動作する。
-  //
-  // workerSrc: 3.x は .js (CJS) なので require.resolve が使える
-  //   (webpack が ESM として拒否しない)。
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const pdfjs = require("pdfjs-dist/build/pdf.js") as {
-    getDocument: (params: {
-      data: Uint8Array;
-      useWorkerFetch?: boolean;
-      disableFontFace?: boolean;
-    }) => {
-      promise: Promise<{
-        numPages: number;
-        getPage: (n: number) => Promise<{
-          getTextContent: () => Promise<{
-            items: Array<{ str?: string }>;
-          }>;
-          cleanup: () => void;
-        }>;
-        destroy: () => Promise<void>;
-      }>;
-      onPassword: ((fn: () => void) => void) | null;
-    };
-    GlobalWorkerOptions: { workerSrc: string };
-  };
-
-  // workerSrc: require.resolve() は webpack がビルド時に module ID（数値）へ置換するため
-  // pdfjs の内部で .endsWith() を呼ぶと "not a function" エラーになる。
-  // path.join(process.cwd(), ...) はビルド時に静的解析されず、実行時に正しい絶対パスを返す。
-  // Vercel での process.cwd() は /var/task（プロジェクトルート）。
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const nodePath = require("path") as typeof import("path");
-  pdfjs.GlobalWorkerOptions.workerSrc = nodePath.join(
-    process.cwd(),
-    "node_modules",
-    "pdfjs-dist",
-    "build",
-    "pdf.worker.js"
-  );
-
-  const TIMEOUT_MS = 25_000; // 25 秒タイムアウト
-  const MAX_PAGES = 150; // 最大 150 ページ
-
-  const parsePromise = (async () => {
-    const task = pdfjs.getDocument({
-      data: new Uint8Array(buffer),
-      useWorkerFetch: false, // ネットワークフェッチを無効化
-      disableFontFace: true, // テキスト抽出のみ：フォント読み込み省略
-    });
-
-    const pdfDoc = await task.promise;
-
-    try {
-      const numPages = Math.min(pdfDoc.numPages, MAX_PAGES);
-      const pageTexts: string[] = [];
-
-      for (let i = 1; i <= numPages; i++) {
-        try {
-          const page = await pdfDoc.getPage(i);
-          const textContent = await page.getTextContent();
-          const text = textContent.items
-            .map((item) => item.str ?? "")
-            .join(" ");
-          pageTexts.push(text.trim());
-          page.cleanup();
-        } catch {
-          // パース失敗ページはスキップして続行
-          pageTexts.push("");
-        }
-      }
-
-      return pageTexts.filter(Boolean).join("\n\n");
-    } finally {
-      // doc.destroy() を必ず await（pdf-parse が await しないため問題だった）
-      await pdfDoc.destroy();
-    }
-  })();
-
-  // タイムアウトタイマーの参照を保持し、必ず clearTimeout する。
-  //
-  // 【重要】Promise.race に渡した timeoutPromise は、parsePromise が先に
-  // 終了（成功・失敗問わず）した後も 25 秒タイマーが残り続ける。
-  // clearTimeout しないと setTimeout コールバックが 25 秒後に reject() を
-  // 呼び出し、誰も await していない Promise が拒否される → unhandledRejection。
+  // pdfjs の内部クリーンアップが unhandledRejection を発生させることがある。
   // Node.js 15+ はデフォルトで unhandledRejection をプロセス終了扱いにするため
-  // サーバーレス関数がクラッシュし、次リクエストが 500 HTML になる原因となる。
+  // PDF 解析の間だけ一時的にハンドラを追加してプロセスクラッシュを防ぐ。
+  //
+  // スコープを PDF 解析中に限定することで、他の処理の unhandledRejection を
+  // 隠蔽しないようにしている。
+  const absorbedRejections: unknown[] = [];
+  const rejectionHandler = (reason: unknown) => {
+    absorbedRejections.push(reason);
+  };
+  process.on("unhandledRejection", rejectionHandler);
+
+  // タイムアウトタイマーの参照を保持し、finally で必ず clearTimeout する。
+  // clearTimeout しないと 25 秒後に reject() が発火して unhandledRejection になる。
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutId = setTimeout(
       () => reject(new Error("PDF解析がタイムアウトしました（25秒超）")),
-      TIMEOUT_MS
+      25_000
     );
   });
+
+  const parsePromise = (async () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pdfParse = require("pdf-parse") as (
+      dataBuffer: Buffer,
+      options?: { max?: number }
+    ) => Promise<{ text: string; numpages: number }>;
+
+    const result = await pdfParse(buffer, {
+      max: 150, // 最大 150 ページ
+    });
+    return result.text;
+  })();
 
   try {
     return await Promise.race([parsePromise, timeoutPromise]);
   } finally {
-    // parsePromise が先に終了した場合: タイマーをキャンセルして unhandledRejection を防ぐ
-    // timeoutPromise が先に終了した場合: タイマーはすでに発火済みなので clearTimeout は無害
+    // タイムアウトタイマーをキャンセル（unhandledRejection リーク防止）
     if (timeoutId !== undefined) {
       clearTimeout(timeoutId);
+    }
+
+    // pdfjs の非同期クリーンアップが完了するまで待ってからハンドラを解除する。
+    // setTimeout(50ms) で現在の I/O コールバック・マイクロタスク・macrotask が
+    // 完了するのを待ち、pdfjs 内部の非同期後始末を吸収できるウィンドウを確保する。
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    process.removeListener("unhandledRejection", rejectionHandler);
+
+    if (absorbedRejections.length > 0) {
+      console.warn(
+        `[extractFromPDF] ${absorbedRejections.length} unhandledRejection(s) absorbed:`,
+        absorbedRejections.map((r) =>
+          r instanceof Error ? r.message : String(r)
+        )
+      );
     }
   }
 }
