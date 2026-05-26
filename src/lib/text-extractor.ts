@@ -135,14 +135,31 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
     }
   })();
 
-  const timeoutPromise = new Promise<never>((_, reject) =>
-    setTimeout(
+  // タイムアウトタイマーの参照を保持し、必ず clearTimeout する。
+  //
+  // 【重要】Promise.race に渡した timeoutPromise は、parsePromise が先に
+  // 終了（成功・失敗問わず）した後も 25 秒タイマーが残り続ける。
+  // clearTimeout しないと setTimeout コールバックが 25 秒後に reject() を
+  // 呼び出し、誰も await していない Promise が拒否される → unhandledRejection。
+  // Node.js 15+ はデフォルトで unhandledRejection をプロセス終了扱いにするため
+  // サーバーレス関数がクラッシュし、次リクエストが 500 HTML になる原因となる。
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(
       () => reject(new Error("PDF解析がタイムアウトしました（25秒超）")),
       TIMEOUT_MS
-    )
-  );
+    );
+  });
 
-  return Promise.race([parsePromise, timeoutPromise]);
+  try {
+    return await Promise.race([parsePromise, timeoutPromise]);
+  } finally {
+    // parsePromise が先に終了した場合: タイマーをキャンセルして unhandledRejection を防ぐ
+    // timeoutPromise が先に終了した場合: タイマーはすでに発火済みなので clearTimeout は無害
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
 }
 
 async function extractFromDocx(buffer: Buffer): Promise<string> {
