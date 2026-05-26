@@ -63,7 +63,7 @@ export async function extractText(
 async function extractFromPDF(buffer: Buffer): Promise<string> {
   // ── OOM 根本原因と修正方針 ─────────────────────────────────────────────────
   //
-  // ■ 根本原因（Vercel OOM の真因）
+  // ■ 根本原因①（単発 OOM）
   //   pdfjs v1.10.100 は起動時に global.PDFJS をそのまま内部設定として使う。
   //   (pdf.js:14173: if (!_global_scope2.default.PDFJS) { _global_scope2.default.PDFJS = {}; })
   //   つまり global.PDFJS === pdfjs 内部の PDFJS オブジェクト。
@@ -73,16 +73,22 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
   //     bytesToString(new Uint8Array(fontBinary))  → 大きな Latin-1 文字列
   //     btoa(上記文字列)                          → さらに大きな base64 文字列
   //     "@font-face { ... }" CSS ルール            → 結合された巨大文字列
-  //
   //   その後 insertRule() が Node.js で document 未定義のため例外を投げ、
   //   fontReady コールバックが loadingContext.requests に残ったまま解放されない。
-  //   これが 1800MB OOM の原因。
   //
-  // ■ 修正
-  //   require("pdf-parse") 呼び出し前に global.PDFJS に disableFontFace: true を
-  //   設定する。pdfjs はモジュール初期化時に global.PDFJS を読み込むため、
-  //   createFontFaceRule() が即座に null を返し、大きな文字列生成と
-  //   loadingContext.requests へのリークが発生しない。
+  // ■ 根本原因②（ウォーム Lambda 累積 OOM）
+  //   pdf-parse は内部で doc.destroy() を await せずに呼ぶ（fire-and-forget）。
+  //   そのため WorkerTransport / commonObjs / fontLoader などが非同期クリーンアップ待ち
+  //   のままリクエストをまたいで蓄積し、複数リクエスト後に OOM に達する。
+  //
+  // ■ 解決策：worker_threads による完全メモリ分離
+  //   pdf-parse を独立した worker thread で実行する。
+  //   - worker thread は独自のモジュールキャッシュを持つため、global.PDFJS を
+  //     require('pdf-parse') より前に設定することで disableFontFace が確実に適用される。
+  //   - worker.terminate() 呼び出し時にスレッドのヒープ全体が解放されるため、
+  //     doc.destroy() の未完了 Promise に関わらず累積リークが発生しない。
+  //   - pdfParsePath は require.resolve() で解決した絶対パスを渡し、
+  //     worker thread 内でのモジュール解決の曖昧さをなくす。
   //
   // ■ その他の設定
   //   disableAutoFetch / disableStream / disableRange:
@@ -92,47 +98,88 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
   //   cMapUrl = null / cMapPacked = false:
   //     CMap 外部フェッチを即座に reject → 未完了 Promise をなくす。
   // ──────────────────────────────────────────────────────────────────────────────
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(
-      () => reject(new Error("PDF解析がタイムアウトしました（25秒超）")),
-      25_000
-    );
-  });
 
-  const parsePromise = (async () => {
-    // pdfjs が global.PDFJS を内部 PDFJS として使うため、require より前に設定する
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const g = global as any;
+  const { Worker } = await import("worker_threads");
+
+  // Worker コード：eval: true で worker thread 内でインライン実行される
+  const WORKER_CODE = `
+const { workerData, parentPort } = require('worker_threads');
+(async () => {
+  try {
+    // worker thread は独自のモジュールキャッシュを持つため、require より前に設定すれば
+    // pdfjs モジュール初期化時（pdf.js:1981 globalSettings スナップショット）に確実に反映される
+    const g = global;
     g.PDFJS                        = g.PDFJS || {};
     g.PDFJS.disableAutoFetch       = true;
     g.PDFJS.disableStream          = true;
     g.PDFJS.disableRange           = true;
-    g.PDFJS.disableFontFace        = true;  // ← 根本修正: 大きな base64 生成を防ぐ
+    g.PDFJS.disableFontFace        = true;   // CJK base64 巨大文字列生成を防ぐ
     g.PDFJS.disableCreateObjectURL = true;
     g.PDFJS.cMapUrl                = null;
     g.PDFJS.cMapPacked             = false;
 
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const pdfParse = require("pdf-parse") as (
-      dataBuffer: Buffer,
-      options?: { max?: number }
-    ) => Promise<{ text: string; numpages: number }>;
-
-    const result = await pdfParse(buffer, {
-      max: 150, // 最大 150 ページ
-    });
-    return result.text;
-  })();
-
-  try {
-    return await Promise.race([parsePromise, timeoutPromise]);
-  } finally {
-    // タイムアウトタイマーをキャンセル（unhandledRejection リーク防止）
-    if (timeoutId !== undefined) {
-      clearTimeout(timeoutId);
-    }
+    // 絶対パスで require することで Vercel 環境でのモジュール解決の曖昧さをなくす
+    const pdfParse = require(workerData.pdfParsePath);
+    const buf = Buffer.from(workerData.pdfBuffer);
+    const result = await pdfParse(buf, { max: 150 });
+    parentPort.postMessage({ ok: true, text: result.text });
+  } catch (err) {
+    parentPort.postMessage({ ok: false, error: err instanceof Error ? err.message : String(err) });
   }
+})();
+`;
+
+  // Buffer の実体部分だけを ArrayBuffer としてコピー
+  // （buffer.buffer は Node.js のプール領域全体を指す場合があるため slice が必要）
+  const arrayBuffer = buffer.buffer.slice(
+    buffer.byteOffset,
+    buffer.byteOffset + buffer.byteLength
+  ) as ArrayBuffer;
+
+  return new Promise<string>((resolve, reject) => {
+    const worker = new Worker(WORKER_CODE, {
+      eval: true,
+      workerData: {
+        pdfBuffer: arrayBuffer,
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        pdfParsePath: require.resolve("pdf-parse"),
+      },
+    });
+
+    let settled = false;
+    const settle = (fn: () => void) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeoutId);
+        // terminate() でスレッドヒープを即時解放
+        worker.terminate().catch(() => {});
+        fn();
+      }
+    };
+
+    const timeoutId = setTimeout(() => {
+      settle(() => reject(new Error("PDF解析がタイムアウトしました（25秒超）")));
+    }, 25_000);
+
+    worker.once("message", (msg: { ok: boolean; text?: string; error?: string }) => {
+      settle(() => {
+        if (msg.ok) resolve(msg.text ?? "");
+        else reject(new Error(msg.error ?? "PDF parse failed"));
+      });
+    });
+
+    worker.once("error", (err) => settle(() => reject(err)));
+
+    worker.once("exit", (code) => {
+      // 0 = 正常終了、1 = terminate() による強制終了（どちらも想定内）
+      // それ以外の予期しないコードのみ reject する
+      if (code !== 0 && code !== 1) {
+        settle(() =>
+          reject(new Error(`PDF worker が予期しないコードで終了しました: ${code}`))
+        );
+      }
+    });
+  });
 }
 
 async function extractFromDocx(buffer: Buffer): Promise<string> {
